@@ -1,0 +1,8 @@
+PyQt6
+qasync
+PyQt6-Qt6
+PyQt6-sip
+pyqtgraph
+pandas
+numpy
+yfinance
