@@ -10,6 +10,7 @@ class VerifiedNews:
     sentiment: str
     timestamp: float
     summary: Optional[str] = None
+    impact: str = "NORMAL" # "NORMAL", "HIGH", "CRITICAL"
 
 class NewsAggregator:
     """
@@ -20,6 +21,20 @@ class NewsAggregator:
         self.threshold = consensus_threshold
         self._buffer: Dict[str, List[Dict]] = {} # Key: Symbol, Value: List of news items
         self.ttl = 30  # Seconds to wait for corroboration
+
+    def _analyze_impact(self, headline: str, summary: str = None) -> str:
+        """Determines if news is NORMAL, HIGH, or CRITICAL."""
+        text = (headline + " " + (summary or "")).upper()
+        
+        # Keywords
+        critical_terms = ["BANKRUPTCY", "HALT", "ACQUISITION", "MERGER", "GUIDANCE LOWERED", "FDA APPROVAL", "CRASH"]
+        high_terms = ["EARNINGS", "REVENUE", "GROWTH", "SURGE", "RECORD", "BEATS", "MISSES", "GUIDANCE"]
+        
+        if any(term in text for term in critical_terms):
+            return "CRITICAL"
+        if any(term in text for term in high_terms):
+            return "HIGH"
+        return "NORMAL"
 
     def process(self, source: str, symbol: str, headline: str, sentiment: str, summary: str = None) -> Optional[VerifiedNews]:
         """
@@ -59,13 +74,17 @@ class NewsAggregator:
             # Clear buffer to avoid re-triggering for the same event immediately
             self._buffer[symbol] = [] 
             
+            # Analyze Impact on the latest headline
+            impact = self._analyze_impact(headline, best_summary)
+            
             return VerifiedNews(
                 symbol=symbol,
                 headline=headline, # Use the latest headline
                 sources=sources,
                 sentiment=sentiment,
                 timestamp=now,
-                summary=best_summary
+                summary=best_summary,
+                impact=impact
             )
         
         return None

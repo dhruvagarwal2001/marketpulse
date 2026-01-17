@@ -3,7 +3,11 @@ from collections import deque
 from .backend import MarketStream
 from .analysis import TechnicalAnalyst
 from .intelligence import NewsAggregator, FundamentalAnalyst, FundamentalData
+from .agent import TraderAgent
 import logging
+import re
+import os
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +18,7 @@ class Controller(QObject):
     """
     
     # Signal to update the UI
-    show_alert = pyqtSignal(str, str, str, object, list, str, str)
+    show_alert = pyqtSignal(str, str, str, object, list, str, str, str)
     # Signal to update Queue Counter in UI
     queue_updated = pyqtSignal(int)
 
@@ -28,6 +32,10 @@ class Controller(QObject):
         self.tech_analyst = TechnicalAnalyst()
         self.news_aggregator = NewsAggregator(consensus_threshold=1) 
         self.fund_analyst = FundamentalAnalyst()
+        # [NEW] The Wolf with REAL EYES
+        load_dotenv()
+        api_key = os.getenv("GEMINI_API_KEY")
+        self.agent = TraderAgent(api_key=api_key)
         
         # Flow Control
         self.alert_queue = deque()
@@ -75,11 +83,11 @@ class Controller(QObject):
             return
 
         # Prepare payload
-        alert_data = self.alert_queue.popleft()
+        alert_payload = self.alert_queue.popleft() # Renamed to avoid confusion
         self.queue_updated.emit(len(self.alert_queue))
         
         # Emit to UI
-        self.show_alert.emit(*alert_data)
+        self.show_alert.emit(*alert_payload)
         
         # Reset Timer to ensure user gets full 15s to read
         if self.mode == "AUTO":
@@ -117,19 +125,50 @@ class Controller(QObject):
                     verdict = "NEWS ONLY"
                     history = None # Explicitly set to None to trigger Text-Only Mode in UI
                 
-                # Construct Rich Description
-                description = verified_news.headline
-                if verified_news.summary:
-                     description += f"\n\n{verified_news.summary}"
+                # [NEW] AGENT ANALYSIS
+                # Ask the Wolf to interpret the news
+                agent_response = self.agent.analyze(
+                    symbol=event.symbol,
+                    headline=verified_news.headline,
+                    summary=verified_news.summary
+                )
+                
+                # Construct Rich Description from Agent's perspective
+                description = f"{agent_response.summary}<br><br>"
+                
+                # Format the reasoning with HTML colors using Regex for robustness
+                reasoning_html = agent_response.reasoning.replace("\n", "<br>")
+                
+                # Highlight TRADER (Cyan)
+                reasoning_html = re.sub(
+                    r"(⚡\s*TRADER(?:\s*\(.*?\))?:)", 
+                    r"<br><font color='#00F0FF'><b>\1</b></font>", 
+                    reasoning_html, 
+                    flags=re.IGNORECASE
+                )
+                
+                # Highlight INVESTOR (Gold)
+                reasoning_html = re.sub(
+                    r"(💎\s*INVESTOR(?:\s*\(.*?\))?:)", 
+                    r"<br><br><font color='#D4AF37'><b>\1</b></font>", 
+                    reasoning_html, 
+                    flags=re.IGNORECASE
+                )
+                
+                description += f"<b>ANALYSIS LOADED:</b><br>{reasoning_html}"
+
+                # Update Verdict with Agent's take
+                verdict = f"{agent_response.action} ({int(agent_response.confidence*100)}%)"
 
                 alert_payload = (
-                    f"📰 {event.symbol} NEWS",
-                    description,
-                    verdict,
+                    str(agent_response.headline), # Use Agent's re-written slogan
+                    str(description),
+                    str(verdict),
                     history,
                     verified_news.sources,
-                    None,
-                    event.data.get('url')
+                    "", # Fundamentals (Empty String instead of None)
+                    event.data.get('url') or "", # URL (Empty String instead of None)
+                    str(verified_news.impact) # Keep original impact flag
                 )
 
         elif event.event_type == "FUNDAMENTALS":
@@ -147,7 +186,8 @@ class Controller(QObject):
                 history,
                 ["SEC Filings"],
                 analysis['summary'], # Fix: Dictionary access
-                None
+                None,
+                "NORMAL" # Fundamentals treated as NORMAL for now, or calculate based on score
             )
             
         # ENQUEUE

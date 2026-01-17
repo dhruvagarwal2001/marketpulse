@@ -6,3 +6,5 @@ pyqtgraph
 pandas
 numpy
 yfinance
+google-generativeai
+python-dotenv

@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QApplication, QFrame, QGraphicsOpacityEffect, QSizePolicy)
+                             QPushButton, QApplication, QFrame, QGraphicsOpacityEffect, QSizePolicy, QScrollArea, QSizeGrip)
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QRect, QPoint, QSequentialAnimationGroup, QTimer
 from PyQt6.QtGui import QColor, QFont, QCursor, QPainter, QPen, QBrush, QLinearGradient
 import pyqtgraph as pg
@@ -125,6 +125,7 @@ class SmartDock(QWidget):
         self.layout.addWidget(self.container)
         
         # Opacity Effect (Attached to Container for global fade)
+        # Opacity Effect (Attached to Container for global fade)
         self._fade_eff = QGraphicsOpacityEffect(self.container)
         self._fade_eff.setOpacity(1.0)
         self.container.setGraphicsEffect(self._fade_eff)
@@ -146,9 +147,10 @@ class SmartDock(QWidget):
         self.action_frame.setVisible(False)
         self.action_layout = QVBoxLayout()
         self.action_layout.setSpacing(10)
+        self.action_layout.setContentsMargins(0, 0, 0, 0)
         self.action_frame.setLayout(self.action_layout)
         
-        # Header
+        # Header (Title)
         self.header_layout = QVBoxLayout()
         self.title_label = QLabel("TITLE")
         self.title_label.setObjectName("TitleLabel")
@@ -176,6 +178,8 @@ class SmartDock(QWidget):
         self.desc_label = QLabel("Description goes here.")
         self.desc_label.setWordWrap(True)
         self.desc_label.setObjectName("DescLabel")
+        self.desc_label.setTextFormat(Qt.TextFormat.RichText)
+        self.desc_label.setOpenExternalLinks(True)
         self.action_layout.addWidget(self.desc_label)
         
         # Fundamentals
@@ -198,6 +202,19 @@ class SmartDock(QWidget):
         self.chart.setMinimumHeight(150) # Ensure it has space
         self.chart.hide() 
         self.action_layout.addWidget(self.chart)
+        
+        # Buttons logic follows...
+        
+        # --- RESIZING GRIP ---
+        self.sizegrip = QSizeGrip(self)
+        self.sizegrip.setStyleSheet("background: transparent; width: 20px; height: 20px;")
+        
+        # Min/Max Size
+        self.setMinimumSize(350, 200)
+        self.setMinimumSize(350, 200)
+        self.setMaximumSize(900, 2000) # Increased max height significantly
+
+
         
         # Buttons
         self.btn_layout = QHBoxLayout()
@@ -259,6 +276,12 @@ class SmartDock(QWidget):
         self.action_layout.addLayout(self.control_layout)
         
         self.container_layout.addWidget(self.action_frame)
+
+    def resizeEvent(self, event):
+        """Handle resizing logic."""
+        rect = self.rect()
+        self.sizegrip.move(rect.right() - self.sizegrip.width(), rect.bottom() - self.sizegrip.height())
+        super().resizeEvent(event)
 
     def update_queue_count(self, count):
         """Updates the Next button text based on queue size."""
@@ -391,12 +414,37 @@ class SmartDock(QWidget):
             #NextBtn:hover {
                  color: #FFFFFF;
             }
+            /* High Impact Styles */
+            .CriticalBorder {
+                border: 2px solid #FF3333;
+                background-color: #1a0505;
+            }
+            .HighImpactBorder {
+                border: 2px solid #D4AF37;
+                background-color: #1a1505;
+            }
+            #CriticalBadge {
+                background-color: #FF3333;
+                color: #FFFFFF;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-weight: 900;
+                font-size: 11px;
+            }
+            #HighBadge {
+                background-color: #D4AF37;
+                color: #000000;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-weight: 900;
+                font-size: 11px;
+            }
         """)
 
     # --- Interaction Logic ---
     
     def expand(self, title: str, description: str, verdict: str = None, history = None, 
-               sources: list = None, fundamentals: str = None, url: str = None):
+               sources: list = None, fundamentals: str = None, url: str = None, impact: str = "NORMAL"):
         """Staggered Expansion: Resize -> Show Content -> Fade In"""
         
         # Stop any running animations
@@ -407,6 +455,20 @@ class SmartDock(QWidget):
         # 1. Prepare Content (Hidden)
         self.pulse_label.setVisible(False)
         
+        # Reset Container Style
+        self.container.setStyleSheet("") # Clear previous dynamic styles
+        self.container.setProperty("class", "") 
+        
+        # Apply Impact Styling
+        if impact == "CRITICAL":
+             self.container.setStyleSheet("#Container { border: 2px solid #FF3333; background-color: #150505; }")
+             title = "🚨 " + title
+        elif impact == "HIGH":
+             self.container.setStyleSheet("#Container { border: 2px solid #D4AF37; background-color: #151005; }")
+             title = "⚡ " + title
+        else:
+             self.container.setStyleSheet("#Container { border: 1px solid #222222; background-color: #080808; }")
+
         self.title_label.setText(title)
         self.desc_label.setText(description)
         
@@ -421,7 +483,15 @@ class SmartDock(QWidget):
                  self.verdict_label.setStyleSheet("#VerdictLabel { color: #D4AF37; border: 1px solid #D4AF37; background: rgba(212,175,55,0.1); }")
         
         if sources:
-            self.source_label.setText(f"VIA {' • '.join(sources)}")
+            source_text = f"VIA {' • '.join(sources)}"
+            if impact == "CRITICAL":
+                source_text = "⚠️ BREAKING • " + source_text
+            self.source_label.setText(source_text)
+            
+            if impact == "CRITICAL":
+                 self.source_label.setStyleSheet("color: #FF3333;")
+            else:
+                 self.source_label.setStyleSheet("color: #888899;")
         
         if fundamentals:
             self.fund_label.setText(fundamentals)
@@ -462,11 +532,37 @@ class SmartDock(QWidget):
              self.desc_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
              self.desc_label.adjustSize()
 
-        # 2. Step A: Resize Window (Content is still hidden, so no layout constraints)
+        # 2. Step A: Resize Window (Content is hidden but we can calculate text height)
+        # Calculate dynamic height
+        # Base height (Headers + Badges + Margins + Chart buffer) = ~250px
+        # We need to approximate the text height.
+        base_height = 250
+        text_width = self.action_size.width() - 60 # Approx width minus margins
+        
+        # Use FontMetrics to calculate expected height of the description
+        font = self.desc_label.font()
+        fm = self.desc_label.fontMetrics()
+        rect = fm.boundingRect(QRect(0, 0, text_width, 10000), Qt.TextFlag.TextWordWrap, description)
+        text_height = rect.height()
+        
+        # Add buffer for Title, Verdict, Source (approx 100px)
+        total_text_height = text_height + 120 
+        
+        # Chart height (if visible)
+        chart_height = 160 if (history is not None and not history.empty) else 0
+        
+        target_height = base_height + total_text_height + chart_height
+        
+        # Clamp Logic
+        # Clamp Logic
+        target_height = max(400, min(target_height, 1800)) # Min 400, Max 1800
+        
+        target_size = QSize(self.action_size.width(), target_height)
+
         self._resize_anim = QPropertyAnimation(self, b"size")
         self._resize_anim.setDuration(350)
         self._resize_anim.setStartValue(self.size())
-        self._resize_anim.setEndValue(self.action_size)
+        self._resize_anim.setEndValue(target_size)
         self._resize_anim.setEasingCurve(QEasingCurve.Type.OutBack)
         self._resize_anim.finished.connect(self._start_expand_fade)
         self._resize_anim.start()

@@ -1,20 +1,4 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual Environment
+*.pyc
+.env
 .venv/
-venv/
-env/
-
-# Database
-*.db
-brain.db
-
-# IDEs
-.vscode/
-.idea/
-
-# Artifacts
-*.log
