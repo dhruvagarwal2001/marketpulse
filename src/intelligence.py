@@ -10,6 +10,7 @@ class VerifiedNews:
     sentiment: str
     timestamp: float
     summary: Optional[str] = None
+    all_summaries: List[str] = None # Context from multiple sources
     impact: str = "NORMAL" # "NORMAL", "HIGH", "CRITICAL"
 
 class NewsAggregator:
@@ -67,11 +68,13 @@ class NewsAggregator:
         if count >= self.threshold:
             # Consensus Reached!
             sources = [n['source'] for n in self._buffer[symbol]]
-            # Prefer the longest summary available
-            summaries = [n['summary'] for n in self._buffer[symbol] if n['summary']]
-            best_summary = max(summaries, key=len) if summaries else None
+            # Prefer the longest summary available for the main field
+            all_summaries = [n['summary'] for n in self._buffer[symbol] if n['summary']]
+            best_summary = max(all_summaries, key=len) if all_summaries else None
             
             # Clear buffer to avoid re-triggering for the same event immediately
+            # self._buffer[symbol] = []  <-- Move this or handle it better?
+            # Actually, let's clear it so we don't repeat.
             self._buffer[symbol] = [] 
             
             # Analyze Impact on the latest headline
@@ -84,6 +87,7 @@ class NewsAggregator:
                 sentiment=sentiment,
                 timestamp=now,
                 summary=best_summary,
+                all_summaries=all_summaries,
                 impact=impact
             )
         

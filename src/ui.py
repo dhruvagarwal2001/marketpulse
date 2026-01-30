@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QApplication, QFrame, QGraphicsOpacityEffect, QSizePolicy, QScrollArea, QSizeGrip)
+                             QPushButton, QApplication, QFrame, QGraphicsOpacityEffect, QSizePolicy, QScrollArea, QSizeGrip, QComboBox, QLineEdit)
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QRect, QPoint, QSequentialAnimationGroup, QTimer
 from PyQt6.QtGui import QColor, QFont, QCursor, QPainter, QPen, QBrush, QLinearGradient
 import pyqtgraph as pg
@@ -88,6 +88,7 @@ class SmartDock(QWidget):
     action_triggered = pyqtSignal(str)
     mode_toggled = pyqtSignal(str) # "AUTO" or "MANUAL"
     next_clicked = pyqtSignal()
+    filter_changed = pyqtSignal(str) # "ALL" or "NVDA", etc.
 
     def __init__(self):
         super().__init__()
@@ -270,6 +271,23 @@ class SmartDock(QWidget):
         self.next_btn.setStyleSheet("color: #555566;") # Disabled look initially
         
         self.control_layout.addWidget(self.mode_btn)
+        
+        # [NEW] SEARCH / FILTER
+        self.search_box = QComboBox()
+        self.search_box.setObjectName("SearchBox")
+        self.search_box.setEditable(True)
+        self.search_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.search_box.setPlaceholderText("FILTER TICKER...")
+        self.search_box.setMinimumWidth(120)
+        self.search_box.addItems(["ALL"]) # Default
+        
+        # Style the line edit inside
+        self.search_box.lineEdit().setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.search_box.currentTextChanged.connect(self._on_search_changed)
+        
+        self.control_layout.addSpacing(10)
+        self.control_layout.addWidget(self.search_box)
+        
         self.control_layout.addStretch()
         self.control_layout.addWidget(self.next_btn)
         
@@ -314,6 +332,21 @@ class SmartDock(QWidget):
                 background-color: #080808; /* Onyx Black */
                 border: 1px solid #222222;
                 border-radius: 24px;
+            }
+            #SearchBox {
+                background-color: #111116;
+                color: #00F0FF;
+                border: 1px solid #333344;
+                border-radius: 6px;
+                padding: 2px;
+                font-family: 'Consolas', monospace;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            #SearchBox QAbstractItemView {
+                background-color: #111116;
+                color: #CCCCCC;
+                selection-background-color: #333344;
             }
             #PulseLabel {
                 font-size: 32px;
@@ -442,6 +475,19 @@ class SmartDock(QWidget):
         """)
 
     # --- Interaction Logic ---
+
+    def set_universe(self, tickers: list):
+        """Populate the search box with the universe."""
+        self.search_box.blockSignals(True)
+        self.search_box.clear()
+        self.search_box.addItem("ALL")
+        self.search_box.addItems(sorted(tickers))
+        self.search_box.blockSignals(False)
+
+    def _on_search_changed(self, text):
+        """Emit filter signal."""
+        # Clean specific chars if needed
+        self.filter_changed.emit(text.upper())
     
     def expand(self, title: str, description: str, verdict: str = None, history = None, 
                sources: list = None, fundamentals: str = None, url: str = None, impact: str = "NORMAL"):

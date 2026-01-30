@@ -37,14 +37,19 @@ class TraderAgent:
         self.role = "Hedge Fund Manager"
         self.style = "Aggressive, Cynical, Profit-Driven"
 
-    def analyze(self, symbol: str, headline: str, summary: str, market_data=None) -> AgentResponse:
+    def analyze(self, symbol: str, headline: str, summary: str, all_summaries: list = None, market_data=None) -> AgentResponse:
         """
         Main entry point. Uses LLM if available, else High-Fidelity Simulation.
         """
+        # Combine summaries if multiple are provided for better context
+        combined_summary = summary
+        if all_summaries and len(all_summaries) > 1:
+            combined_summary = "\n---\n".join(all_summaries)
+
         # 1. Use Real Intelligence if Key is Present
         if self.model:
             try:
-                return self._query_llm(symbol, headline, summary)
+                return self._query_llm(symbol, headline, combined_summary)
             except Exception as e:
                 print(f"LLM Error: {e}. Falling back to Simulation.")
                 # Fallthrough to simulation

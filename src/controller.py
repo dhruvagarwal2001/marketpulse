@@ -40,6 +40,7 @@ class Controller(QObject):
         # Flow Control
         self.alert_queue = deque()
         self.mode = "AUTO" # "AUTO" or "MANUAL"
+        self.current_filter = "ALL"
         
         self.timer = QTimer()
         self.timer.setInterval(15000) # 15 Seconds
@@ -50,13 +51,29 @@ class Controller(QObject):
         self.ui.action_triggered.connect(self.handle_user_action)
         self.ui.mode_toggled.connect(self.set_mode)
         self.ui.next_clicked.connect(self.force_next_alert)
+        self.ui.filter_changed.connect(self.update_filter)
         
         # Connect internal signal to UI slot
         self.show_alert.connect(self.ui.expand)
         self.queue_updated.connect(self.ui.update_queue_count)
 
+        # Init UI Data
+        # Ensure we pass the full universe to the search box, even if it loads later
+        # Note: If sync happens async, this might be empty initially. 
+        # We should probably listen for a signal, but for now passing the reference or updating later is key.
+        # Since _sync_universe is async in market.start(), it won't be ready immediately here.
+        # Let's trust that the next update cycle or a re-set will handle it, OR just pass the reference.
+        self.ui.set_universe(self.market_stream.full_universe)
+
         # Subscribe
         self.market_stream.subscribe(self.process_market_event)
+
+    def update_filter(self, filter_text):
+        """Updates the current active filter."""
+        self.current_filter = filter_text
+        self.ui.update_queue_count(len(self.alert_queue)) # Just to refresh
+        if self.mode == "AUTO":
+             self._try_show_next()
 
     def set_mode(self, mode: str):
         """Switches between AUTO and MANUAL."""
@@ -78,16 +95,27 @@ class Controller(QObject):
             self._try_show_next()
 
     def _try_show_next(self, force=False):
-        """Pops the next alert if available and emits it."""
+        """Pops the next alert if available and limits it."""
         if not self.alert_queue:
             return
 
-        # Prepare payload
-        alert_payload = self.alert_queue.popleft() # Renamed to avoid confusion
+        # Find the first item that matches the filter
+        matched_item = None
+        for item in self.alert_queue:
+            if self._matches_filter(item['symbol']):
+                matched_item = item
+                break
+        
+        if not matched_item:
+            return # Nothing matches current filter, wait.
+
+        # Remove the specific item we found
+        self.alert_queue.remove(matched_item)
         self.queue_updated.emit(len(self.alert_queue))
         
         # Emit to UI
-        self.show_alert.emit(*alert_payload)
+        # Unpack the payload tuple from the wrapper
+        self.show_alert.emit(*matched_item['payload'])
         
         # Reset Timer to ensure user gets full 15s to read
         if self.mode == "AUTO":
@@ -97,10 +125,15 @@ class Controller(QObject):
         """Ingests raw events, verifies them, and enqueues them."""
         
         # THROTTLE: If queue is full (3+), ignore new events to save resources
-        if len(self.alert_queue) >= 3:
+        if len(self.alert_queue) >= 5: # Increased buffer for filtering
             return
         
         alert_payload = None
+
+        if event.event_type == "UNIVERSE_UPDATE":
+             logger.info(f"Received Universe Update: {len(event.data)} tickers")
+             self.ui.set_universe(event.data)
+             return
 
         if event.event_type == "RAW_NEWS":
             verified_news = self.news_aggregator.process(
@@ -130,7 +163,8 @@ class Controller(QObject):
                 agent_response = self.agent.analyze(
                     symbol=event.symbol,
                     headline=verified_news.headline,
-                    summary=verified_news.summary
+                    summary=verified_news.summary,
+                    all_summaries=verified_news.all_summaries
                 )
                 
                 # Construct Rich Description from Agent's perspective
@@ -191,9 +225,10 @@ class Controller(QObject):
             )
             
         # ENQUEUE
-        # ENQUEUE
         if alert_payload:
-            self.alert_queue.append(alert_payload)
+            # Wrap in dict for filtering
+            item = {'symbol': event.symbol, 'payload': alert_payload}
+            self.alert_queue.append(item)
             self.queue_updated.emit(len(self.alert_queue))
             
             # If queue was empty and we are in Auto, show immediately? 
@@ -202,6 +237,11 @@ class Controller(QObject):
             if len(self.alert_queue) == 1 and self.mode == "AUTO" and not self.timer.isActive():
                  self._try_show_next()
                  self.timer.start(15000)
+
+    def _matches_filter(self, symbol):
+        if not self.current_filter or self.current_filter == "ALL":
+            return True
+        return symbol == self.current_filter
 
     def handle_user_action(self, action):
         logger.info(f"Action: {action}")

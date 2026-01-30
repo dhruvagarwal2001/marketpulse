@@ -17,8 +17,8 @@ def main():
     # 2. Initialize Components
     
     # Backend
-    market = MarketStream()
     brain = LocalBrain() # Ensures DB exists
+    market = MarketStream(brain)
     
     # UI
     dock = SmartDock()
