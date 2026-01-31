@@ -62,12 +62,19 @@ class TraderAgent:
         action = "HOLD"
         confidence = 0.5
         new_headline = headline
-        # Enforce max 10 words constraint (approx) for consistency
-        words = headline.split()
-        if len(words) > 8:
-            new_headline = " ".join(words[:8]) + "..."
-            
-        new_summary = summary or "Market data indicates significant movement. Review details below."
+        # Remove arbitrary constraints if they break the meaning, but try to keep it punchy.
+        # [MODIFIED] No more slicing at 8 words.
+        
+        new_summary = summary or "Market data indicates notable activity."
+        # Format: Context -> Conclusion -> Action
+        new_summary = summary or "Market data indicates notable activity for this security."
+        
+        # 3-Paragraph Narrative Format (Simulation)
+        p1_context = f"The latest data reveals significant movement for {symbol}, driven by {new_summary}. Institutional interest appears elevated as the market processes this material information."
+        p2_impact = "Volatility is expected to rise in the immediate term. The sentiment shift suggests a re-evaluation of the current price level is underway, with liquidity likely concentrating around key technical levels."
+        p3_action = "Traders should monitor for a volume confirmation before committing capital. A breakout above resistance would confirm the trend, while failure to hold support suggests further downside risk. Proper risk management is advised."
+        
+        new_summary = f"{p1_context}<br><br>{p2_impact}<br><br>{p3_action}"
         reasoning = "Unclear signal. \n\nTRADER (1 Day): Wait for volume confirmation. \nINVESTOR (2+ Yrs): No thesis change."
         
         # Bullish Keywords
@@ -83,9 +90,9 @@ class TraderAgent:
             )
             
             new_summary = (
-                f"MAJOR MOVER: {headline}\n\n"
-                f"Why it matters: The stock is surging on positive news ({summary or 'Strong growth signals'}). "
-                "This typically attracts more buyers and drives the price up."
+                f"<b>CONTEXT:</b> {headline} - {summary or 'Strong growth signals detected.'}<br>"
+                f"<b>IMPACT:</b> Immediate repricing of growth expectations. Shorts likely to cover.<br>"
+                f"<b>ACTION:</b> Enter LONG immediately. Trail stop at VWAP."
             )
 
         # Bearish Keywords
@@ -101,9 +108,9 @@ class TraderAgent:
             )
             
             new_summary = (
-                f"WARNING: {headline}\n\n"
-                f"Why it matters: Negative developments ({summary or 'Risk factors detected'}) are shaking investor confidence. "
-                "The stock could see further downside."
+                f"<b>CONTEXT:</b> {headline} - {summary or 'Negative catalyst detected.'}<br>"
+                f"<b>IMPACT:</b> Structural break in confidence. Expect extended downside.<br>"
+                f"<b>ACTION:</b> SELL/SHORT. Do not catch the falling knife."
             )
 
         return AgentResponse(
@@ -130,8 +137,12 @@ class TraderAgent:
             f"Headline: {headline}\n"
             f"Summary: {summary}\n\n"
             "Provide a JSON response with these keys:\n"
-            "- 'headline': A simple, engaging title for a layman. Max 10 words. Contextual and clear.\n"
-            "- 'summary': A contextual explanation for a layman (explain 'why it matters'). Max 150 words. Do NOT be technical.\n"
+            "- 'headline': A high-quality, punchy headline. Do not artificially truncate.\n"
+            "- 'summary': Write a high-quality, comprehensive 3-paragraph narrative description. \n"
+            "   Paragraph 1: Provide full context, covering the key facts, figures, and backstory of the news event. \n"
+            "   Paragraph 2: Analyze the immediate market impact, volatility implications, and sentiment shift. \n"
+            "   Paragraph 3: Conclude with the strategic action for the trader, profit targets, and risk management. \n"
+            "   Do NOT use bold labels like 'CONTEXT:' or 'IMPACT:'. Just write the text fluidly as a professional financial report. Use <br><br> to separate paragraphs.\n"
             "- 'action': One of [AGGRESSIVE BUY, BUY, HOLD, SELL, URGENT SELL].\n"
             "- 'confidence': A float between 0.0 and 1.0.\n"
             "- 'reasoning': A dual-perspective analysis. YOU MUST USE THE EXACT FORMAT BELOW (including emojis):\n"

@@ -36,10 +36,25 @@ class MarketStream:
         self.full_universe = []
         self._cache = {} # To track changes
         
+        # Deduplication Cache (URL or Tuple of (Symbol, Title))
+        self._news_dedup = set()
+        
         # Alpha Vantage Integration
         load_dotenv()
         av_key = os.getenv("ALPHA_VANTAGE_API_KEY")
         self.av_client = AlphaVantageClient(av_key) if av_key else None
+
+    async def track_symbol(self, symbol: str):
+        """Adds a symbol to the active monitoring loop and polls it immediately."""
+        if symbol not in self.monitoring_universe:
+            logger.info(f"MarketStream: Tracking new symbol {symbol}")
+            self.monitoring_universe.append(symbol)
+            # Immediate Poll to give user instant feedback
+            if self.running:
+                # Run as task to not block the caller
+                asyncio.create_task(self._poll_symbol(symbol))
+        else:
+             logger.info(f"MarketStream: Already tracking {symbol}")
 
     def subscribe(self, callback):
         self._subscribers.append(callback)
@@ -58,17 +73,43 @@ class MarketStream:
 
         logger.info(f"MarketStream: DB contains {len(self.full_universe)} tickers. Monitoring {len(self.monitoring_universe)}.")
         
+        # Run Polling Loops in Parallel
+        # 1. Yahoo Finance Loop (Active List: Price + Specific News)
+        # 2. Alpha Vantage Loop (Global Firehose: All News)
+        await asyncio.gather(
+            self._run_yahoo_loop(),
+            self._run_av_loop()
+        )
+
+    async def _run_yahoo_loop(self):
+        """Polls active monitoring list using Yahoo Finance."""
         while self.running:
-            # Poll one symbol at a time for Yahoo (Price + News)
-            # Only poll the ACTIVE monitoring set, not the whole DB!
+            if not self.monitoring_universe:
+                 await asyncio.sleep(1)
+                 continue
+                 
+            # Poll all active symbols rapidly
+            tasks = []
             for symbol in self.monitoring_universe:
                 if not self.running: break
-                await self._poll_symbol(symbol)
-                await asyncio.sleep(2.0)
+                tasks.append(self._poll_symbol(symbol))
             
-            # Poll Alpha Vantage every cycle (or more frequently if needed)
+            # Run symbol polls concurrently (parallel network requests)
+            if tasks:
+                await asyncio.gather(*tasks)
+            
+            await asyncio.sleep(30) # Wait before next detailed scan of monitoring list
+
+    async def _run_av_loop(self):
+        """Polls Global News Stream using Alpha Vantage."""
+        while self.running:
             if self.av_client:
-                await self._poll_alpha_vantage()
+                 await self._poll_alpha_vantage()
+            
+            # Polling delay for AV (Global feed updates frequently but we have loop limits)
+            # Alpha Vantage Free Tier limit is 25 calls per day? No, user has pro or we handle it.
+            # Assuming we want frequent updates. 
+            await asyncio.sleep(60) # Poll global feed every minute
 
     def stop(self):
         self.running = False
@@ -102,54 +143,59 @@ class MarketStream:
             last_price = self._cache.get(symbol, price)
             self._cache[symbol] = price
             
-            # 2. Get News
+            # 2. Get News - Re-enabled for Hybrid Coverage (Yahoo + Alpha Vantage)
+            # logger.info(f"Polling Yahoo for {symbol}...")
             news_list = await asyncio.to_thread(lambda: ticker.news)
-            logger.info(f"{symbol} News Count: {len(news_list) if news_list else 0}")
             
             if news_list:
-                latest = news_list[0]
-                # logger.info(f"RAW NEWS OBJ: {latest}") 
-                
-                # Check for nested 'content' (common in recent yfinance)
-                content = latest.get('content', latest) 
-                
-                headline = content.get('title') or content.get('headline', 'No Headline')
-                
-                # Parse
-                headline = latest.get('title', 'No Headline')
-                publisher = latest.get('publisher', 'Unknown')
-                url = latest.get('link', '')
-                
-                # Safe Extraction for Nested Objects
-                if 'content' in latest and isinstance(latest['content'], dict):
-                    headline = latest['content'].get('title', headline)
-                    publisher = latest['content'].get('publisher', publisher)
-                    url = latest['content'].get('canonicalUrl', {}).get('url', url)
+                logger.debug(f"Yahoo found {len(news_list)} items for {symbol}")
+                for latest in news_list[:2]: # Check top 2 recent news items, not just 1
+                    # Check for nested 'content' (common in recent yfinance)
+                    # Correct Parsing Logic for both flat and nested yfinance objects
+                    content = latest.get('content', latest) 
+                    
+                    headline = content.get('title') or content.get('headline', 'No Headline')
+                    publisher = content.get('publisher', 'Unknown')
+                    url = content.get('canonicalUrl', {}).get('url', '') if isinstance(content.get('canonicalUrl'), dict) else content.get('link', '')
+                    
+                    if headline == "No Headline":
+                         continue
+                    
+                    # --- DEDUPLICATION (Hybrid) ---
+                    dedup_key = url if url else f"{headline}|{publisher}"
+                     
+                    # Check DB
+                    # if self.db and self.db.is_news_seen(dedup_key):
+                    #      # logger.info(f"Skipping duplicate Yahoo news: {headline}")
+                    #      continue 
+                    if dedup_key in self._news_dedup:
+                         continue
+                         
+                    # Mark Seen
+                    self._news_dedup.add(dedup_key)
+                    if self.db: self.db.mark_news_seen(dedup_key)
+                    
+                    logger.info(f"New Yahoo News for {symbol}: {headline}")
 
-                logger.info(f"Parsed News: {headline}")
+                    # Extract Summary if available (Fallback to headline if missing)
+                    summary = latest.get('summary', '') 
+                    if not summary and 'content' in latest and isinstance(latest['content'], dict):
+                        summary = latest['content'].get('summary', '')
 
-                if headline == "No Headline":
-                     return # Skip invalid news
-                
-                # Extract Summary if available (Fallback to headline if missing)
-                summary = latest.get('summary', '') 
-                if not summary and 'content' in latest and isinstance(latest['content'], dict):
-                    summary = latest['content'].get('summary', '')
-
-                # Emit RAW_NEWS
-                event = MarketEvent(
-                    event_type="RAW_NEWS",
-                    symbol=symbol,
-                    data={
-                        "source": publisher,
-                        "headline": headline,
-                        "summary": summary,
-                        "sentiment": "NEUTRAL", 
-                        "url": url
-                    },
-                    timestamp=time.time()
-                )
-                self._emit(event)
+                    # Emit RAW_NEWS
+                    event = MarketEvent(
+                        event_type="RAW_NEWS",
+                        symbol=symbol,
+                        data={
+                            "source": f"{publisher} (via Yahoo)",
+                            "headline": headline,
+                            "summary": summary,
+                            "sentiment": "NEUTRAL", 
+                            "url": url
+                        },
+                        timestamp=time.time()
+                    )
+                    self._emit(event)
                 
             # 3. Simulate Fundamentals
             if random.random() > 0.95: 
@@ -170,76 +216,89 @@ class MarketStream:
             logger.error(f"Error polling {symbol}: {e}")
 
     async def _poll_alpha_vantage(self):
-        """Fetches news from Alpha Vantage for the entire universe."""
+        """Fetches GLOBAL news from Alpha Vantage (All Markets)."""
         if not self.av_client:
             return
             
-        # Optimization: Alpha Vantage NEWS_SENTIMENT can only take 50 items max.
-        # We can't poll news for 5000 items. 
-        # Strategy: Poll for the *monitoring_universe* ONLY.
+        # [MODIFIED] GLOBAL FIREHOSE STRATEGY
+        # Instead of asking for specific tickers (which limits us to ~50),
+        # we ask for "Latest News" generally. This returns news for ALL tickers.
+        # We then filter this stream against our "full_universe" to authorize the alert.
         
-        # Split into chunks of 50
-        batch_size = 50
-        for i in range(0, len(self.monitoring_universe), batch_size):
-            chunk = self.monitoring_universe[i:i + batch_size]
+        logger.info("Polling Alpha Vantage Global Feed...")
+        
+        # Pass None to get general market news
+        news_feed = await self.av_client.fetch_news(tickers=None) 
+        
+        if not news_feed:
+             return
+
+        for item in news_feed:
+            # Alpha Vantage provides news for multiple tickers in one article
             
-            logger.info(f"Polling Alpha Vantage for chunk {i}: {chunk[:3]}...")
-            news_feed = await self.av_client.fetch_news(chunk)
+            headline = item.get("title", "No Headline")
+            summary = item.get("summary", "")
+            url = item.get("url", "")
+            source = item.get("source", "Alpha Vantage")
             
-            for item in news_feed:
-                # ... (rest of processing loop)
-                # Extract relevant info
-                headline = item.get("title", "No Headline")
-                summary = item.get("summary", "")
-                url = item.get("url", "")
-                source = item.get("source", "Alpha Vantage")
+            # --- DEDUPLICATION ---
+            # Use URL if available, else Headline + Source
+            dedup_key = url if url else f"{headline}|{source}"
+            
+            # 1. Check Memory Cache first (Fast)
+            if dedup_key in self._news_dedup:
+                continue 
+            
+            # 2. Check Persistent DB (Robust)
+            if self.db and self.db.is_news_seen(dedup_key):
+                self._news_dedup.add(dedup_key) # Sync memory
+                continue
                 
-                # Find which of our universe tickers this applies to
-                # (Ticker sentiment contains the relevant tickers)
-                ticker_sentiments = item.get("ticker_sentiment", [])
-                for ts in ticker_sentiments:
-                    av_symbol = ts.get("ticker")
-                    
-                    # Try to find a match in our universe
-                    matched_symbol = None
-                    for u_symbol in self.monitoring_universe: # Match against monitored
-                        if av_symbol == u_symbol:
-                            matched_symbol = u_symbol
-                            break
-                        # Check mapped versions
-                        if "-" in u_symbol and av_symbol == u_symbol.split("-")[0]:
-                            matched_symbol = u_symbol
-                            break
-                        if u_symbol == "EURUSD=X" and av_symbol in ["EURUSD", "EUR/USD"]:
-                            matched_symbol = u_symbol
-                            break
-                        if u_symbol == "^GSPC" and av_symbol in ["SPY", "GSPC", "S&P 500"]:
-                            matched_symbol = u_symbol
-                            break
-                    
-                    if matched_symbol:
-                        # Map sentiment labels to our format if needed
-                        av_sentiment = ts.get("ticker_sentiment_label", "Neutral")
-                        
-                        event = MarketEvent(
-                            event_type="RAW_NEWS",
-                            symbol=matched_symbol,
-                            data={
-                                "source": f"{source} (via AlphaVantage)",
-                                "headline": headline,
-                                "summary": summary,
-                                "sentiment": av_sentiment.upper(),
-                                "url": url
-                            },
-                            timestamp=time.time()
-                        )
-                        self._emit(event)
+            # New Item! Mark as seen in both
+            self._news_dedup.add(dedup_key)
+            if self.db:
+                self.db.mark_news_seen(dedup_key)
             
-            # Rate limit protection between chunks?
-            # Free tier is 5 req/min. 
-            # If we have 1 chunk we are fine. If we have 10 chunks we die.
-            # Assume monitoring universe is small (<50) for now.
-            break # FORCE ONLY ONE CHUNK for safety on Free Tier
+            # Maintenance: Keep set size manageable (last 2000 items)
+            if len(self._news_dedup) > 2000:
+                self._news_dedup.pop()
+
+            # Ticker Sentiment contains the list of stocks mentioned
+            ticker_sentiments = item.get("ticker_sentiment", [])
+            
+            for ts in ticker_sentiments:
+                av_symbol = ts.get("ticker")
+                
+                # CHECK VALIDITY: Is this a known US Stock?
+                # We check against full_universe (populated from LISTING_STATUS)
+                # If full_universe is empty (startup), we allow it tentatively (or strict check?)
+                # Let's be permissive if DB is empty, but strict if populated.
+                
+                is_valid = False
+                if self.full_universe:
+                    if av_symbol in self.full_universe:
+                        is_valid = True
+                else:
+                    # Fallback if DB not ready: allow standard looking tickers
+                    if av_symbol and av_symbol.isalpha(): 
+                        is_valid = True
+                        
+                if is_valid:
+                    av_sentiment = ts.get("ticker_sentiment_label", "Neutral")
+                    
+                    event = MarketEvent(
+                        event_type="RAW_NEWS",
+                        symbol=av_symbol, # Use the AV symbol directly as it matches our DB
+                        data={
+                            "source": f"{source} (via AlphaVantage)",
+                            "headline": headline,
+                            "summary": summary,
+                            "sentiment": av_sentiment.upper(),
+                            "url": url
+                        },
+                        timestamp=time.time()
+                    )
+                    self._emit(event)
 
     async def _sync_universe(self):
         """Loads FULL universe from DB. Updates from Alpha Vantage daily."""
@@ -260,12 +319,29 @@ class MarketStream:
         
         if force_update or (time.time() - last_update > 86400): # 24 hours
              logger.info("MarketStream: Performing Message Universe Sync (LISTING_STATUS)...")
+             # 1. Try SEC (Official, Free, Comprehensive)
+             try:
+                 logger.info("MarketStream: Fetching official ticker list from SEC...")
+                 sec_tickers = await self._fetch_sec_tickers()
+                 if sec_tickers:
+                     logger.info(f"Fetched {len(sec_tickers)} tickers from SEC. Saving...")
+                     self.db.add_tickers(sec_tickers)
+                     self.full_universe = self.db.get_tickers()
+                     self.db.set_setting("last_universe_update", str(time.time()))
+                     
+                     # EMIT EVENT TO REFRESH UI
+                     self._emit(MarketEvent("UNIVERSE_UPDATE", "SYSTEM", self.full_universe, time.time()))
+                     return # Success!
+             except Exception as e:
+                 logger.error(f"SEC Fetch failed: {e}")
+
+             # 2. Fallback to Alpha Vantage (Backup)
              if self.av_client:
                  try:
                      # FETCH ALL US LISTINGS
                      all_tickers = await self.av_client.fetch_listing_status()
                      if all_tickers:
-                        logger.info(f"Fetched {len(all_tickers)} tickers. Saving to DB...")
+                        logger.info(f"Fetched {len(all_tickers)} tickers from AV. Saving...")
                         self.db.add_tickers(all_tickers)
                         self.full_universe = self.db.get_tickers() # Reload
                         self.db.set_setting("last_universe_update", str(time.time()))
@@ -274,6 +350,33 @@ class MarketStream:
                         self._emit(MarketEvent("UNIVERSE_UPDATE", "SYSTEM", self.full_universe, time.time()))
                  except Exception as e:
                      logger.error(f"Failed to update universe: {e}")
+
+    async def _fetch_sec_tickers(self) -> List[str]:
+        """Fetches all US public companies directly from the SEC."""
+        url = "https://www.sec.gov/files/company_tickers.json"
+        headers = {
+            "User-Agent": "TradingCopilot/1.0 (contact@example.com)",
+            "Accept-Encoding": "gzip, deflate",
+            "Host": "www.sec.gov"
+        }
+        
+        try:
+             # Run in thread to avoid blocking loop
+             response = await asyncio.to_thread(requests.get, url, headers=headers)
+             response.raise_for_status()
+             data = response.json()
+             
+             # SEC format is Dict[str, Dict] -> {"0": {"ticker": "AAPL", ...}}
+             tickers = []
+             for key in data:
+                 entry = data[key]
+                 if "ticker" in entry:
+                     tickers.append(entry["ticker"].upper())
+            
+             return tickers
+        except Exception as e:
+             logger.error(f"SEC Download Error: {e}")
+             return []
 
     def _emit(self, event):
         for callback in self._subscribers:
@@ -320,8 +423,19 @@ class LocalBrain:
             )
         ''')
         
+        # News Deduplication Table [NEW]
+        # Stores hash of URL or Headline to prevent repeats across restarts
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS seen_news (
+                id TEXT PRIMARY KEY,
+                timestamp REAL
+            )
+        ''')
+        
         conn.commit()
         conn.close()
+        
+
 
     def add_tickers(self, tickers: List[str]):
         if not tickers: return
@@ -364,6 +478,29 @@ class LocalBrain:
         conn.close()
         return result[0] if result else None
 
+    def is_news_seen(self, news_id: str) -> bool:
+        """Checks if news_id exists in DB."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM seen_news WHERE id = ?', (news_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+
+    def mark_news_seen(self, news_id: str):
+        """Marks news_id as seen. Auto-cleans old entries."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        now = time.time()
+        cursor.execute('INSERT OR IGNORE INTO seen_news (id, timestamp) VALUES (?, ?)', (news_id, now))
+        
+        # Cleanup old news (older than 24h) roughly 10% of the time to save performance
+        if random.random() > 0.9:
+             cursor.execute('DELETE FROM seen_news WHERE timestamp < ?', (now - 86400,))
+        
+        conn.commit()
+        conn.close()
+
 class AlphaVantageClient:
     """
     Alpha Vantage API Client for News & Sentiment.
@@ -372,32 +509,33 @@ class AlphaVantageClient:
         self.api_key = api_key
         self.base_url = "https://www.alphavantage.co/query"
 
-    async def fetch_news(self, tickers: List[str]) -> List[Dict]:
-        """Fetches latest news sentiment for a list of tickers."""
+    async def fetch_news(self, tickers: List[str] = None) -> List[Dict]:
+        """Fetches latest news. If tickers is None, fetches GLOBAL market news."""
         if not self.api_key:
             return []
             
-        # Map symbols for Alpha Vantage
-        av_tickers = []
-        for t in tickers:
-            if "-" in t and not t.startswith("^"): # Crypto e.g. BTC-USD
-                av_tickers.append(t.split("-")[0])
-            elif t == "EURUSD=X":
-                av_tickers.append("EURUSD")
-            elif t.startswith("^"): # Indices
-                if t == "^GSPC": av_tickers.append("SPY")
-                elif t == "^IXIC": av_tickers.append("QQQ")
-            else:
-                av_tickers.append(t)
-
-        symbols_str = ",".join(av_tickers)
         params = {
             "function": "NEWS_SENTIMENT",
-            "tickers": symbols_str,
             "apikey": self.api_key,
             "sort": "LATEST",
-            "limit": 10
+            "limit": 50
         }
+        
+        if tickers:
+            # Map symbols for Alpha Vantage
+            av_tickers = []
+            for t in tickers:
+                if "-" in t and not t.startswith("^"): # Crypto e.g. BTC-USD
+                    av_tickers.append(t.split("-")[0])
+                elif t == "EURUSD=X":
+                    av_tickers.append("EURUSD")
+                elif t.startswith("^"): # Indices
+                    if t == "^GSPC": av_tickers.append("SPY")
+                    elif t == "^IXIC": av_tickers.append("QQQ")
+                else:
+                    av_tickers.append(t)
+            
+            params["tickers"] = ",".join(av_tickers)
         
         try:
             # Perform blocking request in a thread

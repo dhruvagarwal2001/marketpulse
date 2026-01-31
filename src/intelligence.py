@@ -91,7 +91,47 @@ class NewsAggregator:
                 impact=impact
             )
         
-        return None
+    def flush(self, timeout: int = 10) -> List[VerifiedNews]:
+        """Returns buffered news that has timed out waiting for consensus."""
+        flushed = []
+        now = time.time()
+        
+        # Iterate over copy of keys since we might delete
+        for symbol in list(self._buffer.keys()):
+            items = self._buffer[symbol]
+            if not items: 
+                continue
+                
+            # Check age of oldest item
+            oldest_time = min(n['time'] for n in items)
+            if now - oldest_time > timeout:
+                # Timed out! Emit partial news.
+                
+                # Consolidate what we have (even if just 1 source)
+                sources = [n['source'] for n in items]
+                all_summaries = [n['summary'] for n in items if n['summary']]
+                best_summary = max(all_summaries, key=len) if all_summaries else None
+                latest_headline = items[-1]['headline']
+                sentiment = items[-1]['sentiment']
+                
+                impact = self._analyze_impact(latest_headline, best_summary)
+                
+                vn = VerifiedNews(
+                    symbol=symbol,
+                    headline=latest_headline,
+                    sources=sources,
+                    sentiment=sentiment,
+                    timestamp=now,
+                    summary=best_summary,
+                    all_summaries=all_summaries,
+                    impact=impact
+                )
+                flushed.append(vn)
+                
+                # Clear buffer
+                self._buffer[symbol] = []
+                
+        return flushed
 
 @dataclass
 class FundamentalData:

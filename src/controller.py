@@ -30,6 +30,8 @@ class Controller(QObject):
         
         # Intelligence
         self.tech_analyst = TechnicalAnalyst()
+        # [MODIFIED] Threshold 1: We trust the Backend Global Deduplication to filter repeats.
+        # This ensures the FIRST verified source (Yahoo OR Alpha Vantage) triggers the Agent immediately.
         self.news_aggregator = NewsAggregator(consensus_threshold=1) 
         self.fund_analyst = FundamentalAnalyst()
         # [NEW] The Wolf with REAL EYES
@@ -69,8 +71,21 @@ class Controller(QObject):
         self.market_stream.subscribe(self.process_market_event)
 
     def update_filter(self, filter_text):
-        """Updates the current active filter."""
-        self.current_filter = filter_text
+        """Updates the current active filter and requests data if needed."""
+        self.current_filter = filter_text.upper() # Ensure uppercase
+        
+        # [NEW] Dynamic Tuning: If user selects a specific ticker, start monitoring it immediately
+        if self.current_filter and self.current_filter != "ALL":
+             # We need to schedule the async method from this sync slot
+             import asyncio
+             # Check if we have a running loop
+             try:
+                 loop = asyncio.get_running_loop()
+                 loop.create_task(self.market_stream.track_symbol(self.current_filter))
+             except RuntimeError:
+                 # Fallback if no loop (unlikely in qasync app)
+                 logger.warning("No running event loop to schedule track_symbol")
+
         self.ui.update_queue_count(len(self.alert_queue)) # Just to refresh
         if self.mode == "AUTO":
              self._try_show_next()
@@ -91,6 +106,15 @@ class Controller(QObject):
 
     def _on_timer_tick(self):
         """Called every 15s in AUTO mode."""
+        
+        # 1. Flush Stale News (Singles that didn't get corroboration)
+        flushed_news = self.news_aggregator.flush(timeout=10) # 10s wait window
+        if flushed_news:
+            logger.info(f"Flushing {len(flushed_news)} single-source news items...")
+            for verified_news in flushed_news:
+                self._analyze_and_queue(verified_news, url=None) # URL lost in agg unless we track it better, fine for now.
+
+        # 2. Show Alert
         if self.mode == "AUTO":
             self._try_show_next()
 
@@ -145,65 +169,9 @@ class Controller(QObject):
             )
             
             if verified_news:
-                # Get Context
-                history = self.market_stream.get_history(event.symbol)
-                
-                # Check if history is valid/meaningful
-                has_history = history is not None and not history.empty
-                
-                if has_history:
-                    tech_signal = self.tech_analyst.analyze(history)
-                    verdict = f"{tech_signal.action} ({int(tech_signal.confidence*100)}%)"
-                else:
-                    verdict = "NEWS ONLY"
-                    history = None # Explicitly set to None to trigger Text-Only Mode in UI
-                
-                # [NEW] AGENT ANALYSIS
-                # Ask the Wolf to interpret the news
-                agent_response = self.agent.analyze(
-                    symbol=event.symbol,
-                    headline=verified_news.headline,
-                    summary=verified_news.summary,
-                    all_summaries=verified_news.all_summaries
-                )
-                
-                # Construct Rich Description from Agent's perspective
-                description = f"{agent_response.summary}<br><br>"
-                
-                # Format the reasoning with HTML colors using Regex for robustness
-                reasoning_html = agent_response.reasoning.replace("\n", "<br>")
-                
-                # Highlight TRADER (Cyan)
-                reasoning_html = re.sub(
-                    r"(⚡\s*TRADER(?:\s*\(.*?\))?:)", 
-                    r"<br><font color='#00F0FF'><b>\1</b></font>", 
-                    reasoning_html, 
-                    flags=re.IGNORECASE
-                )
-                
-                # Highlight INVESTOR (Gold)
-                reasoning_html = re.sub(
-                    r"(💎\s*INVESTOR(?:\s*\(.*?\))?:)", 
-                    r"<br><br><font color='#D4AF37'><b>\1</b></font>", 
-                    reasoning_html, 
-                    flags=re.IGNORECASE
-                )
-                
-                description += f"<b>ANALYSIS LOADED:</b><br>{reasoning_html}"
-
-                # Update Verdict with Agent's take
-                verdict = f"{agent_response.action} ({int(agent_response.confidence*100)}%)"
-
-                alert_payload = (
-                    str(agent_response.headline), # Use Agent's re-written slogan
-                    str(description),
-                    str(verdict),
-                    history,
-                    verified_news.sources,
-                    "", # Fundamentals (Empty String instead of None)
-                    event.data.get('url') or "", # URL (Empty String instead of None)
-                    str(verified_news.impact) # Keep original impact flag
-                )
+                # Use common handler
+                # Note: URL might be specific to the last event, but for aggregation we can just pass this one.
+                self._analyze_and_queue(verified_news, url=event.data.get('url'))
 
         elif event.event_type == "FUNDAMENTALS":
             data = FundamentalData(**event.data)
@@ -223,20 +191,87 @@ class Controller(QObject):
                 None,
                 "NORMAL" # Fundamentals treated as NORMAL for now, or calculate based on score
             )
-            
+
+            # ENQUEUE Fundamentals
+            if alert_payload:
+                item = {'symbol': event.symbol, 'payload': alert_payload}
+                self.alert_queue.append(item)
+                self.queue_updated.emit(len(self.alert_queue))
+
+    def _analyze_and_queue(self, verified_news, url=None):
+        """Common logic to analyze verified news (from event or flush) and enqueue it."""
+        
+        # Get Context
+        history = self.market_stream.get_history(verified_news.symbol)
+        
+        # Check if history is valid/meaningful
+        has_history = history is not None and not history.empty
+        
+        if has_history:
+            tech_signal = self.tech_analyst.analyze(history)
+            verdict = f"{tech_signal.action} ({int(tech_signal.confidence*100)}%)"
+        else:
+            verdict = "NEWS ONLY"
+            history = None # Explicitly set to None to trigger Text-Only Mode in UI
+        
+        # [NEW] AGENT ANALYSIS
+        # Ask the Wolf to interpret the news
+        agent_response = self.agent.analyze(
+            symbol=verified_news.symbol,
+            headline=verified_news.headline,
+            summary=verified_news.summary,
+            all_summaries=verified_news.all_summaries
+        )
+        
+        # Construct Rich Description from Agent's perspective
+        description = f"{agent_response.summary}<br><br>"
+        
+        # Format the reasoning with HTML colors using Regex for robustness
+        reasoning_html = agent_response.reasoning.replace("\n", "<br>")
+        
+        # Highlight TRADER (Cyan)
+        reasoning_html = re.sub(
+            r"(⚡\s*TRADER(?:\s*\(.*?\))?:)", 
+            r"<br><font color='#00F0FF'><b>\1</b></font>", 
+            reasoning_html, 
+            flags=re.IGNORECASE
+        )
+        
+        # Highlight INVESTOR (Gold)
+        reasoning_html = re.sub(
+            r"(💎\s*INVESTOR(?:\s*\(.*?\))?:)", 
+            r"<br><br><font color='#D4AF37'><b>\1</b></font>", 
+            reasoning_html, 
+            flags=re.IGNORECASE
+        )
+        
+        description += f"<b>ANALYSIS LOADED:</b><br>{reasoning_html}"
+
+        # Update Verdict with Agent's take
+        verdict = f"{agent_response.action} ({int(agent_response.confidence*100)}%)"
+
+        alert_payload = (
+            str(agent_response.headline), # Use Agent's re-written slogan
+            str(description),
+            str(verdict),
+            history,
+            verified_news.sources,
+            "", # Fundamentals (Empty String instead of None)
+            url or "", # URL
+            str(verified_news.impact) # Keep original impact flag
+        )
+        
         # ENQUEUE
-        if alert_payload:
-            # Wrap in dict for filtering
-            item = {'symbol': event.symbol, 'payload': alert_payload}
-            self.alert_queue.append(item)
-            self.queue_updated.emit(len(self.alert_queue))
-            
-            # If queue was empty and we are in Auto, show immediately? 
-            # Design Choice: Wait for timer to keep rhythm.
-            # EXCEPTION: If the user is staring at a blank screen (first load), trigger once.
-            if len(self.alert_queue) == 1 and self.mode == "AUTO" and not self.timer.isActive():
-                 self._try_show_next()
-                 self.timer.start(15000)
+        # Wrap in dict for filtering
+        item = {'symbol': verified_news.symbol, 'payload': alert_payload}
+        self.alert_queue.append(item)
+        self.queue_updated.emit(len(self.alert_queue))
+        
+        # Urgent Trigger for first item
+        if len(self.alert_queue) == 1 and self.mode == "AUTO" and not self.timer.isActive():
+                self._try_show_next()
+                self.timer.start(15000)
+
 
     def _matches_filter(self, symbol):
         if not self.current_filter or self.current_filter == "ALL":

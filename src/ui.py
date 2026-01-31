@@ -279,7 +279,8 @@ class SmartDock(QWidget):
         self.search_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.search_box.setPlaceholderText("FILTER TICKER...")
         self.search_box.setMinimumWidth(120)
-        self.search_box.addItems(["ALL"]) # Default
+        # Initialize with Common Tickers so it's not empty while fetching
+        self.search_box.addItems(["ALL", "NVDA", "TSLA", "AAPL", "AMD", "MSFT", "GOOGL", "AMZN", "META", "SPY", "QQQ"]) 
         
         # Style the line edit inside
         self.search_box.lineEdit().setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -291,9 +292,19 @@ class SmartDock(QWidget):
         self.control_layout.addStretch()
         self.control_layout.addWidget(self.next_btn)
         
+        # [NEW] Debounce Timer for Search
+        self.filter_timer = QTimer()
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.setInterval(800) # 800ms debounce
+        self.filter_timer.timeout.connect(self._emit_filter_changed)
+        self.pending_filter_text = ""
+        
         self.action_layout.addLayout(self.control_layout)
         
         self.container_layout.addWidget(self.action_frame)
+    
+    def _emit_filter_changed(self):
+        self.filter_changed.emit(self.pending_filter_text.upper())
 
     def resizeEvent(self, event):
         """Handle resizing logic."""
@@ -485,9 +496,9 @@ class SmartDock(QWidget):
         self.search_box.blockSignals(False)
 
     def _on_search_changed(self, text):
-        """Emit filter signal."""
-        # Clean specific chars if needed
-        self.filter_changed.emit(text.upper())
+        """Emit filter signal with debounce."""
+        self.pending_filter_text = text
+        self.filter_timer.start() # Restart debounce timer
     
     def expand(self, title: str, description: str, verdict: str = None, history = None, 
                sources: list = None, fundamentals: str = None, url: str = None, impact: str = "NORMAL"):
@@ -708,6 +719,12 @@ class SmartDock(QWidget):
     # --- Dragging & Click Logic ---
     
     def mousePressEvent(self, event):
+        # Allow child widgets (Buttons, SearchBox) to handle their own clicks
+        child = self.childAt(event.position().toPoint())
+        if child and (isinstance(child, QPushButton) or isinstance(child, QComboBox) or "QLineEdit" in str(type(child))):
+            super().mousePressEvent(event) # Propagate normally
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
             self.old_pos = event.globalPosition().toPoint()
             self.click_start_pos = event.globalPosition().toPoint()
