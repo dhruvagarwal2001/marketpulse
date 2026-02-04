@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QApplication, QFrame, QGraphicsOpacityEffect, QSizePolicy, QScrollArea, QSizeGrip, QComboBox, QLineEdit)
+                             QPushButton, QApplication, QFrame, QGraphicsOpacityEffect, QSizePolicy, QScrollArea, QSizeGrip, QComboBox, QLineEdit, QTextEdit, QDialog)
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, QRect, QPoint, QSequentialAnimationGroup, QTimer
-from PyQt6.QtGui import QColor, QFont, QCursor, QPainter, QPen, QBrush, QLinearGradient
+from PyQt6.QtGui import QColor, QFont, QCursor, QPainter, QPen, QBrush, QLinearGradient, QIcon
 import pyqtgraph as pg
 import pyqtgraph as pg
 
@@ -78,6 +78,210 @@ class RadarLoader(QWidget):
         painter.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
         painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "SEARCHING MARKET DATA...")
 
+class TickerManager(QDialog):
+    """
+    Premium Overlay for adding/validating tickers.
+    Now shows the current watchlist.
+    """
+    tickers_added = pyqtSignal(list) 
+    remove_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None, current_watchlist=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.watchlist = current_watchlist or []
+        self._init_ui()
+        self.setFixedSize(400, 600)
+        
+    def _init_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        self.setLayout(layout)
+        
+        container = QFrame()
+        container.setObjectName("ManagerContainer")
+        container.setStyleSheet("""
+            #ManagerContainer {
+                background-color: #0F0F12;
+                border: 1px solid #333344;
+                border-radius: 16px;
+            }
+            QLabel { color: #AAAAAA; font-size: 11px; font-weight: bold; }
+            QTextEdit {
+                background-color: #080808;
+                border: 1px solid #222222;
+                border-radius: 8px;
+                color: #00F0FF;
+                font-family: 'Consolas', monospace;
+                padding: 10px;
+                max-height: 80px;
+            }
+            QPushButton#AddBtn {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00F0FF, stop:1 #0099FF);
+                color: #000000;
+                border: none;
+                padding: 10px;
+                border-radius: 8px;
+                font-weight: 800;
+            }
+            QPushButton#CloseBtn {
+                background: transparent;
+                color: #555566;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            #WatchlistArea {
+                background-color: #080808;
+                border: 1px solid #222222;
+                border-radius: 8px;
+            }
+            .TickerRow {
+                background-color: #15151A;
+                border: 1px solid #222222;
+                border-radius: 4px;
+                padding: 5px;
+            }
+            .RemoveBtn {
+                color: #FF3333;
+                background: transparent;
+                font-weight: bold;
+                border: none;
+            }
+        """)
+        
+        c_layout = QVBoxLayout()
+        container.setLayout(c_layout)
+        
+        # Header
+        h_layout = QHBoxLayout()
+        title = QLabel("WATCHLIST MANAGER")
+        title.setStyleSheet("color: #FFFFFF; font-size: 14px; letter-spacing: 1px;")
+        close_btn = QPushButton("×")
+        close_btn.setObjectName("CloseBtn")
+        close_btn.setFixedSize(30, 30)
+        close_btn.clicked.connect(self.close)
+        h_layout.addWidget(title)
+        h_layout.addStretch()
+        h_layout.addWidget(close_btn)
+        c_layout.addLayout(h_layout)
+        
+        # 1. Watchlist Section
+        c_layout.addWidget(QLabel("CURRENTLY MONITORING:"))
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("WatchlistArea")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        self.watchlist_container = QWidget()
+        self.watchlist_layout = QVBoxLayout(self.watchlist_container)
+        self.watchlist_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.watchlist_container)
+        c_layout.addWidget(self.scroll)
+        
+        self.refresh_watchlist(self.watchlist)
+        
+        # 2. Add Section
+        c_layout.addSpacing(10)
+        c_layout.addWidget(QLabel("ADD NEW TICKERS:"))
+        self.input_area = QTextEdit()
+        self.input_area.setPlaceholderText("NVDA, TSLA, BTC-USD")
+        c_layout.addWidget(self.input_area)
+        
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #00FF99;")
+        c_layout.addWidget(self.status_label)
+        
+        self.add_btn = QPushButton("VERIFY & TRACK")
+        self.add_btn.setObjectName("AddBtn")
+        self.add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.add_btn.clicked.connect(self._on_add_clicked)
+        c_layout.addWidget(self.add_btn)
+        
+        layout.addWidget(container)
+
+    def refresh_watchlist(self, tickers, alert_counts=None):
+        self.watchlist = sorted(tickers)
+        alert_counts = alert_counts or {}
+        # Clear layout
+        while self.watchlist_layout.count():
+            item = self.watchlist_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        for t in self.watchlist:
+            row = QFrame()
+            row.setStyleSheet("background-color: #121217; border-radius: 4px; border: 1px solid #222222;")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(10, 5, 10, 5)
+            
+            label = QLabel(t)
+            label.setStyleSheet("color: #00F0FF; font-family: 'Consolas'; font-size: 13px; font-weight: bold;")
+            
+            # [NEW] News Status Badge
+            count = alert_counts.get(t, 0)
+            if count > 0:
+                badge = QLabel(f"{count} NEWS")
+                badge.setStyleSheet("""
+                    background-color: rgba(0, 240, 255, 0.1);
+                    color: #00F0FF;
+                    border: 1px solid #00F0FF;
+                    border-radius: 4px;
+                    padding: 2px 6px;
+                    font-size: 9px;
+                    font-weight: 900;
+                """)
+                row_layout.addWidget(badge)
+            
+            row_layout.addSpacing(10)
+            row_layout.addWidget(label)
+            row_layout.addStretch()
+            
+            rem_btn = QPushButton("REMOVE")
+            rem_btn.setObjectName("RemoveBtn")
+            rem_btn.setStyleSheet("color: #FF3333; font-weight: bold; border: none; font-size: 10px;")
+            rem_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            rem_btn.clicked.connect(lambda checked, symbol=t: self.remove_requested.emit(symbol))
+            
+            row_layout.addWidget(label)
+            row_layout.addStretch()
+            row_layout.addWidget(rem_btn)
+            self.watchlist_layout.addWidget(row)
+
+    def _on_add_clicked(self):
+        text = self.input_area.toPlainText()
+        import re
+        parsed = re.split(r'[,\n\s]+', text)
+        tickers = [t.strip().upper() for t in parsed if t.strip()]
+        
+        if not tickers:
+            self.status_label.setText("Please enter at least one ticker.")
+            self.status_label.setStyleSheet("color: #FF3333;")
+            return
+            
+        self.status_label.setText("Verifying tickers...")
+        self.status_label.setStyleSheet("color: #D4AF37;")
+        self.tickers_added.emit(tickers)
+        self.input_area.clear()
+
+    def update_status(self, message, is_error=False):
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet("color: #FF3333;" if is_error else "color: #00FF99;")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.old_pos = event.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, event):
+        if hasattr(self, 'old_pos') and self.old_pos:
+            delta = event.globalPosition().toPoint() - self.old_pos
+            self.move(self.x() + delta.x(), self.y() + delta.y())
+            self.old_pos = event.globalPosition().toPoint()
+
+    def mouseReleaseEvent(self, event):
+        self.old_pos = None
+
 class SmartDock(QWidget):
     """
     The 'Onyx' Trading Interface.
@@ -89,6 +293,8 @@ class SmartDock(QWidget):
     mode_toggled = pyqtSignal(str) # "AUTO" or "MANUAL"
     next_clicked = pyqtSignal()
     filter_changed = pyqtSignal(str) # "ALL" or "NVDA", etc.
+    tickers_requested = pyqtSignal(list) # For manager
+    remove_requested = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -272,6 +478,13 @@ class SmartDock(QWidget):
         
         self.control_layout.addWidget(self.mode_btn)
         
+        self.manage_btn = QPushButton("+")
+        self.manage_btn.setObjectName("ModeBtn") # Use same style
+        self.manage_btn.setToolTip("Manage Watchlist")
+        self.manage_btn.setFixedSize(30, 26)
+        self.manage_btn.clicked.connect(self._show_ticker_manager)
+        self.control_layout.addWidget(self.manage_btn)
+        
         # [NEW] SEARCH / FILTER
         self.search_box = QComboBox()
         self.search_box.setObjectName("SearchBox")
@@ -302,6 +515,36 @@ class SmartDock(QWidget):
         self.action_layout.addLayout(self.control_layout)
         
         self.container_layout.addWidget(self.action_frame)
+        
+        # Ticker Manager Overlay (Lazy Init)
+        self.manager = None
+    
+    def _show_ticker_manager(self):
+        # Calculate alert counts per ticker
+        # We need access to the alert_queue. Since SmartDock doesn't own it, 
+        # we'll emit a signal to the controller to provide this data, or just refresh if the controller calls it.
+        # For now, let's assume the controller will handle the refresh with data.
+        self.tickers_requested.emit([]) # Trigger a refresh from controller
+        
+        if not self.manager:
+            self.manager = TickerManager(self)
+            self.manager.tickers_added.connect(self.tickers_requested.emit)
+            self.manager.remove_requested.connect(self.remove_requested.emit)
+        
+        # Position it near the dock
+        self.manager.move(self.x(), self.y() - self.manager.height() - 10)
+        self.manager.show()
+
+    def update_manager_watchlist(self, tickers, alert_counts=None):
+        """Called by controller to sync data to manager."""
+        if self.manager:
+            self.manager.refresh_watchlist(tickers, alert_counts)
+        # Also update the main search box universe
+        self.set_universe(tickers)
+
+    def update_ticker_status(self, message, is_error=False):
+        if self.manager:
+            self.manager.update_status(message, is_error)
     
     def _emit_filter_changed(self):
         self.filter_changed.emit(self.pending_filter_text.upper())

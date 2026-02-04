@@ -44,17 +44,73 @@ class MarketStream:
         av_key = os.getenv("ALPHA_VANTAGE_API_KEY")
         self.av_client = AlphaVantageClient(av_key) if av_key else None
 
-    async def track_symbol(self, symbol: str):
-        """Adds a symbol to the active monitoring loop and polls it immediately."""
+    async def track_symbol(self, symbol: str) -> bool:
+        """Adds a symbol to the active monitoring loop and polls it immediately. Returns True if valid."""
+        symbol = symbol.upper().strip()
+        if not symbol: return False
+
+        # 1. Check if already known valid
+        is_known = symbol in self.full_universe
+        
+        # 2. If not known, try to verify with yfinance
+        if not is_known:
+             is_valid = await self.validate_ticker(symbol)
+             if not is_valid:
+                  logger.warning(f"MarketStream: {symbol} is not a valid ticker.")
+                  return False
+             # Add to full universe for future quick checks
+             self.full_universe.append(symbol)
+             if self.db: self.db.add_tickers([symbol])
+
         if symbol not in self.monitoring_universe:
             logger.info(f"MarketStream: Tracking new symbol {symbol}")
             self.monitoring_universe.append(symbol)
+            # Persist to DB
+            if self.db:
+                import json
+                self.db.set_setting("monitoring_universe", json.dumps(self.monitoring_universe))
             # Immediate Poll to give user instant feedback
             if self.running:
                 # Run as task to not block the caller
                 asyncio.create_task(self._poll_symbol(symbol))
         else:
              logger.info(f"MarketStream: Already tracking {symbol}")
+        
+        return True
+
+    async def remove_symbol(self, symbol: str):
+        """Removes a symbol from monitoring."""
+        symbol = symbol.upper().strip()
+        if symbol in self.monitoring_universe:
+            self.monitoring_universe.remove(symbol)
+            if self.db:
+                import json
+                self.db.set_setting("monitoring_universe", json.dumps(self.monitoring_universe))
+            logger.info(f"MarketStream: Stopped tracking {symbol}")
+
+    async def validate_ticker(self, symbol: str) -> bool:
+        """Robust ticker verification."""
+        try:
+            # Method 1: Try a tiny history download (Most reliable way to check if it actually has data)
+            df = await asyncio.to_thread(yf.download, symbol, period="1d", interval="1m", progress=False)
+            if not df.empty:
+                return True
+            
+            # Method 2: Fallback to Ticker object attributes
+            ticker = await asyncio.to_thread(yf.Ticker, symbol)
+            # Try to see if it has ANY history at all (max period)
+            info = await asyncio.to_thread(lambda: ticker.history(period="1d"))
+            if not info.empty:
+                return True
+            
+            # Method 3: SEC/Full Universe list fallback (if we already synced it)
+            if symbol in self.full_universe:
+                return True
+                
+            return False
+        except Exception as e:
+            logger.warning(f"Validation failed for {symbol}: {e}")
+            return False
 
     def subscribe(self, callback):
         self._subscribers.append(callback)
@@ -67,9 +123,17 @@ class MarketStream:
         # This will populate self.full_universe (thousands) and self.monitoring_universe (subset)
         await self._sync_universe()
         
-        # Ensure we monitor at least the default set if nothing came back (fail-safe)
+        # [MODIFIED] Load monitoring universe from DB if it exists
+        stored_monitored = self.db.get_setting("monitoring_universe")
+        if stored_monitored:
+            import json
+            try:
+                self.monitoring_universe = json.loads(stored_monitored)
+            except:
+                pass
+        
         if not self.monitoring_universe:
-             self.monitoring_universe = ["NVDA", "TSLA", "AAPL", "BTC-USD", "ETH-USD", "EURUSD=X", "^GSPC"]
+             self.monitoring_universe = ["NVDA", "TSLA", "AAPL", "BTC-USD", "ETH-USD"]
 
         logger.info(f"MarketStream: DB contains {len(self.full_universe)} tickers. Monitoring {len(self.monitoring_universe)}.")
         
@@ -116,13 +180,34 @@ class MarketStream:
         logger.info("MarketStream: Disconnected")
 
     def get_history(self, symbol: str) -> pd.DataFrame:
-        """Fetches real 1-day history (1m intervals) for charts."""
+        """Fetches history with local caching and incremental updates."""
         try:
-            # Fetch last 5 hours of 1m data for granular charts
-            df = yf.download(symbol, period="1d", interval="5m", progress=False, auto_adjust=True)
-            if df.empty:
-                return pd.DataFrame()
-            return df.rename(columns={"Close": "price"}) # Normalize for Analysis
+            # 1. Load from Cache (Last 2 months)
+            two_months_ago = (pd.Timestamp.now() - pd.Timedelta(days=60)).isoformat()
+            cached_df = self.db.get_price_history(symbol, start_time=two_months_ago)
+            
+            # 2. Check if we need more
+            last_ts = self.db.get_last_price_timestamp(symbol)
+            needs_update = True
+            if last_ts and (pd.Timestamp.now(tz=last_ts.tz) - last_ts < pd.Timedelta(minutes=30)):
+                needs_update = False
+            
+            if needs_update:
+                logger.info(f"Fetching incremental history for {symbol}...")
+                # If we have data, fetch from last_ts, else fetch 60d
+                period = "6d" if last_ts else "60d"
+                interval = "5m"
+                
+                # Fetch fresh from Yahoo
+                new_df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+                if not new_df.empty:
+                    new_df = new_df.rename(columns={"Close": "price"})
+                    # Store in DB
+                    self.db.store_prices(symbol, new_df)
+                    # Refresh Cache
+                    cached_df = self.db.get_price_history(symbol, start_time=two_months_ago)
+            
+            return cached_df
         except Exception as e:
             logger.error(f"Failed to fetch history for {symbol}: {e}")
             return pd.DataFrame()
@@ -136,12 +221,25 @@ class MarketStream:
             ticker = await asyncio.to_thread(yf.Ticker, symbol)
             
             # 1. Get Fast Info (Price)
-            price = ticker.fast_info.last_price
-            logger.info(f"{symbol} Price: {price}")
+            price = None
+            try:
+                price = ticker.fast_info.last_price
+                logger.info(f"{symbol} Price: {price}")
+            except Exception as e:
+                logger.warning(f"Fast Info failed for {symbol}: {e}. Trying fallback...")
+                try:
+                    # Fallback to slower .info
+                    info = await asyncio.to_thread(lambda: ticker.info)
+                    price = info.get('currentPrice') or info.get('regularMarketPrice')
+                except Exception as e2:
+                    logger.error(f"Fallback poll failed for {symbol}: {e2}")
             
-            # Detect Price Change
-            last_price = self._cache.get(symbol, price)
-            self._cache[symbol] = price
+            if price is not None:
+                # Detect Price Change
+                last_price = self._cache.get(symbol, price)
+                self._cache[symbol] = price
+            else:
+                logger.warning(f"Could not retrieve price for {symbol}")
             
             # 2. Get News - Re-enabled for Hybrid Coverage (Yahoo + Alpha Vantage)
             # logger.info(f"Polling Yahoo for {symbol}...")
@@ -227,8 +325,12 @@ class MarketStream:
         
         logger.info("Polling Alpha Vantage Global Feed...")
         
-        # Pass None to get general market news
-        news_feed = await self.av_client.fetch_news(tickers=None) 
+        try:
+            # Pass None to get general market news
+            news_feed = await self.av_client.fetch_news(tickers=None) 
+        except Exception as e:
+            logger.error(f"Alpha Vantage Polling error: {e}")
+            return
         
         if not news_feed:
              return
@@ -416,22 +518,112 @@ class LocalBrain:
             )
         ''')
         
-        # Tickers table [NEW]
+        # Tickers table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tickers (
                 symbol TEXT PRIMARY KEY
             )
         ''')
         
-        # News Deduplication Table [NEW]
-        # Stores hash of URL or Headline to prevent repeats across restarts
+        # News Deduplication Table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS seen_news (
                 id TEXT PRIMARY KEY,
                 timestamp REAL
             )
         ''')
+
+        # [NEW] Price History Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_history (
+                symbol TEXT,
+                timestamp DATETIME,
+                price REAL,
+                PRIMARY KEY (symbol, timestamp)
+            )
+        ''')
+
+        # [NEW] Analysis Cache Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_cache (
+                content_hash TEXT PRIMARY KEY,
+                agent_response JSON,
+                timestamp REAL
+            )
+        ''')
         
+        conn.commit()
+        conn.close()
+
+    def store_prices(self, symbol: str, df: pd.DataFrame):
+        """Stores price history in batches."""
+        if df.empty: return
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # Flatten columns if multi-index (yfinance sometimes does this)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            # Prepare data
+            data = []
+            for ts, row in df.iterrows():
+                data.append((symbol, ts.isoformat(), float(row['price'])))
+            
+            cursor = conn.cursor()
+            cursor.executemany('INSERT OR REPLACE INTO price_history (symbol, timestamp, price) VALUES (?, ?, ?)', data)
+            conn.commit()
+        except Exception as e:
+            logger.error(f"DB Error storing prices for {symbol}: {e}")
+        finally:
+            conn.close()
+
+    def get_price_history(self, symbol: str, start_time: Optional[str] = None) -> pd.DataFrame:
+        """Retrieves price history from DB."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            query = 'SELECT timestamp, price FROM price_history WHERE symbol = ?'
+            params = [symbol]
+            if start_time:
+                query += ' AND timestamp >= ?'
+                params.append(start_time)
+            query += ' ORDER BY timestamp ASC'
+            
+            df = pd.read_sql_query(query, conn, index_col='timestamp', params=params)
+            if not df.empty:
+                df.index = pd.to_datetime(df.index)
+            return df
+        except Exception as e:
+            logger.error(f"DB Error fetching prices for {symbol}: {e}")
+            return pd.DataFrame()
+        finally:
+            conn.close()
+
+    def get_last_price_timestamp(self, symbol: str) -> Optional[pd.Timestamp]:
+        """Gets the most recent timestamp we have for a symbol."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(timestamp) FROM price_history WHERE symbol = ?', (symbol,))
+        row = cursor.fetchone()
+        conn.close()
+        return pd.Timestamp(row[0]) if row and row[0] else None
+
+    def get_analysis_cache(self, content_hash: str) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT agent_response FROM analysis_cache WHERE content_hash = ?', (content_hash,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            import json
+            return json.loads(row[0])
+        return None
+
+    def store_analysis_cache(self, content_hash: str, response: Dict):
+        conn = sqlite3.connect(self.db_path)
+        import json
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR REPLACE INTO analysis_cache (content_hash, agent_response, timestamp) VALUES (?, ?, ?)',
+                     (content_hash, json.dumps(response), time.time()))
         conn.commit()
         conn.close()
         

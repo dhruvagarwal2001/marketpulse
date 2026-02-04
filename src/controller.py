@@ -1,4 +1,5 @@
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+import asyncio
 from collections import deque
 from .backend import MarketStream
 from .analysis import TechnicalAnalyst
@@ -54,18 +55,16 @@ class Controller(QObject):
         self.ui.mode_toggled.connect(self.set_mode)
         self.ui.next_clicked.connect(self.force_next_alert)
         self.ui.filter_changed.connect(self.update_filter)
+        self.ui.tickers_requested.connect(self.handle_bulk_tickers)
+        self.ui.remove_requested.connect(self.handle_remove_ticker)
         
         # Connect internal signal to UI slot
         self.show_alert.connect(self.ui.expand)
         self.queue_updated.connect(self.ui.update_queue_count)
 
         # Init UI Data
-        # Ensure we pass the full universe to the search box, even if it loads later
-        # Note: If sync happens async, this might be empty initially. 
-        # We should probably listen for a signal, but for now passing the reference or updating later is key.
-        # Since _sync_universe is async in market.start(), it won't be ready immediately here.
-        # Let's trust that the next update cycle or a re-set will handle it, OR just pass the reference.
-        self.ui.set_universe(self.market_stream.full_universe)
+        # Dropdown should show what we are monitoring
+        self.ui.set_universe(self.market_stream.monitoring_universe)
 
         # Subscribe
         self.market_stream.subscribe(self.process_market_event)
@@ -77,7 +76,6 @@ class Controller(QObject):
         # [NEW] Dynamic Tuning: If user selects a specific ticker, start monitoring it immediately
         if self.current_filter and self.current_filter != "ALL":
              # We need to schedule the async method from this sync slot
-             import asyncio
              # Check if we have a running loop
              try:
                  loop = asyncio.get_running_loop()
@@ -99,6 +97,61 @@ class Controller(QObject):
              self._try_show_next() # Trigger immediately if stuff is waiting
         else:
              self.timer.stop()
+
+    def handle_bulk_tickers(self, tickers):
+        """Processes a list of tickers, validates them, and updates UI."""
+        if not tickers:
+            self._refresh_ui_watchlist()
+            return
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._process_tickers_async(tickers))
+
+    async def _process_tickers_async(self, tickers):
+        # Deduplicate and clean
+        tickers = list(dict.fromkeys([t.upper().strip() for t in tickers if t.strip()]))
+        
+        # Parallel validation
+        tasks = [self.market_stream.track_symbol(t) for t in tickers]
+        results = await asyncio.gather(*tasks)
+        
+        valid_tickers = []
+        invalid_tickers = []
+        
+        for t, success in zip(tickers, results):
+            if success:
+                valid_tickers.append(t)
+            else:
+                invalid_tickers.append(t)
+        
+        # Update UI with results
+        if invalid_tickers:
+            msg = f"Added {len(valid_tickers)}/{len(tickers)} tickers. ERROR: {', '.join(invalid_tickers)} not found."
+            self.ui.update_ticker_status(msg, is_error=True)
+        else:
+            msg = f"Successfully added all {len(valid_tickers)} tickers to watchlist."
+            self.ui.update_ticker_status(msg, is_error=False)
+        
+        self._refresh_ui_watchlist()
+
+    def _refresh_ui_watchlist(self):
+        """Calculates news counts and refreshes UI components."""
+        # Calculate news counts in queue per ticker
+        counts = {}
+        for item in self.alert_queue:
+            symbol = item['symbol']
+            counts[symbol] = counts.get(symbol, 0) + 1
+        
+        # Update UI
+        self.ui.update_manager_watchlist(self.market_stream.monitoring_universe, counts)
+
+    def handle_remove_ticker(self, symbol):
+        """Removes a ticker from monitoring."""
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._remove_ticker_async(symbol))
+
+    async def _remove_ticker_async(self, symbol):
+        await self.market_stream.remove_symbol(symbol)
+        self._refresh_ui_watchlist()
 
     def force_next_alert(self):
         """User clicked 'Next'."""
@@ -141,6 +194,9 @@ class Controller(QObject):
         # Unpack the payload tuple from the wrapper
         self.show_alert.emit(*matched_item['payload'])
         
+        # [NEW] Refresh news counts in manager if it's open
+        self._refresh_ui_watchlist()
+        
         # Reset Timer to ensure user gets full 15s to read
         if self.mode == "AUTO":
             self.timer.start(15000)
@@ -156,7 +212,7 @@ class Controller(QObject):
 
         if event.event_type == "UNIVERSE_UPDATE":
              logger.info(f"Received Universe Update: {len(event.data)} tickers")
-             self.ui.set_universe(event.data)
+             # We keep the dropdown showing the monitored ones, but full_universe is updated in background
              return
 
         if event.event_type == "RAW_NEWS":
@@ -214,14 +270,27 @@ class Controller(QObject):
             verdict = "NEWS ONLY"
             history = None # Explicitly set to None to trigger Text-Only Mode in UI
         
-        # [NEW] AGENT ANALYSIS
-        # Ask the Wolf to interpret the news
-        agent_response = self.agent.analyze(
-            symbol=verified_news.symbol,
-            headline=verified_news.headline,
-            summary=verified_news.summary,
-            all_summaries=verified_news.all_summaries
-        )
+        # [NEW] AGENT ANALYSIS CACHE CHECK
+        import hashlib
+        content_hash = hashlib.md5(f"{verified_news.symbol}|{verified_news.headline}".encode()).hexdigest()
+        cached_analysis = self.db.get_analysis_cache(content_hash)
+        
+        if cached_analysis:
+            logger.info(f"Using cached analysis for {verified_news.symbol}")
+            # Map back to AgentResponse-like object or just use as dict
+            from dataclasses import asdict
+            agent_response = type('obj', (object,), cached_analysis)
+        else:
+            # Ask the Wolf to interpret the news
+            agent_response = self.agent.analyze(
+                symbol=verified_news.symbol,
+                headline=verified_news.headline,
+                summary=verified_news.summary,
+                all_summaries=verified_news.all_summaries
+            )
+            # Cache it
+            from dataclasses import asdict
+            self.db.store_analysis_cache(content_hash, asdict(agent_response))
         
         # Construct Rich Description from Agent's perspective
         description = f"{agent_response.summary}<br><br>"
@@ -267,6 +336,9 @@ class Controller(QObject):
         self.alert_queue.append(item)
         self.queue_updated.emit(len(self.alert_queue))
         
+        # [NEW] Refresh news counts in manager if it's open
+        self._refresh_ui_watchlist()
+
         # Urgent Trigger for first item
         if len(self.alert_queue) == 1 and self.mode == "AUTO" and not self.timer.isActive():
                 self._try_show_next()
