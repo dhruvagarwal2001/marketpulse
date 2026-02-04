@@ -85,12 +85,14 @@ class TickerManager(QDialog):
     """
     tickers_added = pyqtSignal(list) 
     remove_requested = pyqtSignal(str)
+    toggle_priority = pyqtSignal(str)
 
     def __init__(self, parent=None, current_watchlist=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Dialog)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.watchlist = current_watchlist or []
+        self.priority_list = []
         self._init_ui()
         self.setFixedSize(400, 600)
         
@@ -201,9 +203,10 @@ class TickerManager(QDialog):
         
         layout.addWidget(container)
 
-    def refresh_watchlist(self, tickers, alert_counts=None):
+    def refresh_watchlist(self, tickers, alert_counts=None, priority_list=None):
         self.watchlist = sorted(tickers)
         alert_counts = alert_counts or {}
+        self.priority_list = priority_list or []
         # Clear layout
         while self.watchlist_layout.count():
             item = self.watchlist_layout.takeAt(0)
@@ -212,14 +215,30 @@ class TickerManager(QDialog):
         
         for t in self.watchlist:
             row = QFrame()
-            row.setStyleSheet("background-color: #121217; border-radius: 4px; border: 1px solid #222222;")
+            is_prio = t in self.priority_universe if hasattr(self, 'priority_universe') else False # Fallback
+            is_prio = t in self.priority_list
+            
+            row.setStyleSheet(f"""
+                background-color: {'#1A1A22' if is_prio else '#121217'}; 
+                border-radius: 4px; 
+                border: 1px solid {'#D4AF37' if is_prio else '#222222'};
+            """)
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(10, 5, 10, 5)
             
+            # [NEW] Priority Star Toggle
+            prio_btn = QPushButton("★" if is_prio else "☆")
+            prio_btn.setFixedSize(24, 24)
+            prio_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            prio_btn.setStyleSheet(f"color: {'#D4AF37' if is_prio else '#555566'}; background: transparent; border: none; font-size: 16px;")
+            prio_btn.setToolTip("Toggle High-Frequency Polling (RAPID)")
+            prio_btn.clicked.connect(lambda checked, s=t: self.toggle_priority.emit(s))
+            row_layout.addWidget(prio_btn)
+
             label = QLabel(t)
-            label.setStyleSheet("color: #00F0FF; font-family: 'Consolas'; font-size: 13px; font-weight: bold;")
+            label.setStyleSheet(f"color: {'#FFFFFF' if is_prio else '#00F0FF'}; font-family: 'Consolas'; font-size: 13px; font-weight: bold;")
             
-            # [NEW] News Status Badge
+            # News Status Badge
             count = alert_counts.get(t, 0)
             if count > 0:
                 badge = QLabel(f"{count} NEWS")
@@ -295,6 +314,7 @@ class SmartDock(QWidget):
     filter_changed = pyqtSignal(str) # "ALL" or "NVDA", etc.
     tickers_requested = pyqtSignal(list) # For manager
     remove_requested = pyqtSignal(str)
+    toggle_priority = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -530,15 +550,16 @@ class SmartDock(QWidget):
             self.manager = TickerManager(self)
             self.manager.tickers_added.connect(self.tickers_requested.emit)
             self.manager.remove_requested.connect(self.remove_requested.emit)
+            self.manager.toggle_priority.connect(self.toggle_priority.emit)
         
         # Position it near the dock
         self.manager.move(self.x(), self.y() - self.manager.height() - 10)
         self.manager.show()
 
-    def update_manager_watchlist(self, tickers, alert_counts=None):
+    def update_manager_watchlist(self, tickers, alert_counts=None, priority_list=None):
         """Called by controller to sync data to manager."""
         if self.manager:
-            self.manager.refresh_watchlist(tickers, alert_counts)
+            self.manager.refresh_watchlist(tickers, alert_counts, priority_list)
         # Also update the main search box universe
         self.set_universe(tickers)
 

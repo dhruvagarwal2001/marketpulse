@@ -57,6 +57,7 @@ class Controller(QObject):
         self.ui.filter_changed.connect(self.update_filter)
         self.ui.tickers_requested.connect(self.handle_bulk_tickers)
         self.ui.remove_requested.connect(self.handle_remove_ticker)
+        self.ui.toggle_priority.connect(self.handle_priority_toggle)
         
         # Connect internal signal to UI slot
         self.show_alert.connect(self.ui.expand)
@@ -141,8 +142,12 @@ class Controller(QObject):
             symbol = item['symbol']
             counts[symbol] = counts.get(symbol, 0) + 1
         
-        # Update UI
-        self.ui.update_manager_watchlist(self.market_stream.monitoring_universe, counts)
+        # Update UI with counts and priority status
+        self.ui.update_manager_watchlist(
+            self.market_stream.monitoring_universe, 
+            counts,
+            self.market_stream.priority_universe
+        )
 
     def handle_remove_ticker(self, symbol):
         """Removes a ticker from monitoring."""
@@ -151,6 +156,21 @@ class Controller(QObject):
 
     async def _remove_ticker_async(self, symbol):
         await self.market_stream.remove_symbol(symbol)
+        await self.market_stream.unmark_priority(symbol) # Auto-unmark
+        self._refresh_ui_watchlist()
+
+    def handle_priority_toggle(self, symbol):
+        """Toggles priority status for a ticker."""
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._toggle_priority_async(symbol))
+
+    async def _toggle_priority_async(self, symbol):
+        if symbol in self.market_stream.priority_universe:
+            await self.market_stream.unmark_priority(symbol)
+        else:
+            success = await self.market_stream.mark_priority(symbol)
+            if not success:
+                self.ui.update_ticker_status("Priority limit reached (Max 5).", is_error=True)
         self._refresh_ui_watchlist()
 
     def force_next_alert(self):
@@ -327,13 +347,22 @@ class Controller(QObject):
             verified_news.sources,
             "", # Fundamentals (Empty String instead of None)
             url or "", # URL
-            str(verified_news.impact) # Keep original impact flag
+            "CRITICAL" if getattr(verified_news, 'is_priority', False) else str(verified_news.impact) # [NEW] Escalate priority news to CRITICAL
         )
         
         # ENQUEUE
         # Wrap in dict for filtering
         item = {'symbol': verified_news.symbol, 'payload': alert_payload}
-        self.alert_queue.append(item)
+        
+        # [NEW] Push priority alerts to the FRONT of the queue
+        if getattr(verified_news, 'is_priority', False):
+            self.alert_queue.appendleft(item)
+            # Immediate trigger if in AUTO
+            if self.mode == "AUTO":
+                self._try_show_next(force=True)
+        else:
+            self.alert_queue.append(item)
+            
         self.queue_updated.emit(len(self.alert_queue))
         
         # [NEW] Refresh news counts in manager if it's open

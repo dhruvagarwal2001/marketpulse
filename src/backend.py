@@ -10,6 +10,7 @@ import logging
 import yfinance as yf
 import requests
 import os
+import json
 from dotenv import load_dotenv
 
 # Configure logging
@@ -31,7 +32,9 @@ class MarketStream:
         self._subscribers = []
         self.db = db
         # Active Polling List (Start with popular ones)
-        self.monitoring_universe = ["NVDA", "TSLA", "AAPL", "BTC-USD", "ETH-USD", "EURUSD=X", "^GSPC"]
+        self.monitoring_universe = ["NVDA", "TSLA", "AAPL", "BTC-USD", "ETH-USD"]
+        # [NEW] Priority Polling (High-Frequency)
+        self.priority_universe = []
         # Full Available Universe (for UI Search)
         self.full_universe = []
         self._cache = {} # To track changes
@@ -67,7 +70,6 @@ class MarketStream:
             self.monitoring_universe.append(symbol)
             # Persist to DB
             if self.db:
-                import json
                 self.db.set_setting("monitoring_universe", json.dumps(self.monitoring_universe))
             # Immediate Poll to give user instant feedback
             if self.running:
@@ -78,13 +80,39 @@ class MarketStream:
         
         return True
 
+    async def mark_priority(self, symbol: str) -> bool:
+        """Adds symbol to priority list (limit 5)."""
+        symbol = symbol.upper().strip()
+        if symbol not in self.monitoring_universe:
+            return False
+        
+        if symbol in self.priority_universe:
+            return True
+            
+        if len(self.priority_universe) >= 5:
+            return False
+            
+        self.priority_universe.append(symbol)
+        if self.db:
+            self.db.set_setting("priority_universe", json.dumps(self.priority_universe))
+        logger.info(f"MarketStream: {symbol} marked as PRIORITY.")
+        return True
+
+    async def unmark_priority(self, symbol: str):
+        """Removes symbol from priority list."""
+        symbol = symbol.upper().strip()
+        if symbol in self.priority_universe:
+            self.priority_universe.remove(symbol)
+            if self.db:
+                self.db.set_setting("priority_universe", json.dumps(self.priority_universe))
+            logger.info(f"MarketStream: {symbol} removed from priority.")
+
     async def remove_symbol(self, symbol: str):
         """Removes a symbol from monitoring."""
         symbol = symbol.upper().strip()
         if symbol in self.monitoring_universe:
             self.monitoring_universe.remove(symbol)
             if self.db:
-                import json
                 self.db.set_setting("monitoring_universe", json.dumps(self.monitoring_universe))
             logger.info(f"MarketStream: Stopped tracking {symbol}")
 
@@ -126,43 +154,57 @@ class MarketStream:
         # [MODIFIED] Load monitoring universe from DB if it exists
         stored_monitored = self.db.get_setting("monitoring_universe")
         if stored_monitored:
-            import json
             try:
                 self.monitoring_universe = json.loads(stored_monitored)
-            except:
-                pass
+            except: pass
         
-        if not self.monitoring_universe:
-             self.monitoring_universe = ["NVDA", "TSLA", "AAPL", "BTC-USD", "ETH-USD"]
+        # Load priority universe from DB
+        stored_priority = self.db.get_setting("priority_universe")
+        if stored_priority:
+            try:
+                self.priority_universe = json.loads(stored_priority)
+            except: pass
 
-        logger.info(f"MarketStream: DB contains {len(self.full_universe)} tickers. Monitoring {len(self.monitoring_universe)}.")
+        logger.info(f"MarketStream: DB contains {len(self.full_universe)} tickers. Monitoring {len(self.monitoring_universe)}. Priority {len(self.priority_universe)}.")
         
         # Run Polling Loops in Parallel
-        # 1. Yahoo Finance Loop (Active List: Price + Specific News)
-        # 2. Alpha Vantage Loop (Global Firehose: All News)
+        # 1. Priority Loop (RAPID: Every 10s)
+        # 2. Standard Loop (NORMAL: Every 45s)
+        # 3. Alpha Vantage Loop (GLOBAL: Every 60s)
         await asyncio.gather(
+            self._run_priority_loop(),
             self._run_yahoo_loop(),
             self._run_av_loop()
         )
 
-    async def _run_yahoo_loop(self):
-        """Polls active monitoring list using Yahoo Finance."""
+    async def _run_priority_loop(self):
+        """High-frequency polling for priority tickers."""
         while self.running:
-            if not self.monitoring_universe:
-                 await asyncio.sleep(1)
+            if not self.priority_universe:
+                await asyncio.sleep(2)
+                continue
+            
+            logger.debug(f"Priority Scan: {self.priority_universe}")
+            tasks = [self._poll_symbol(s, is_priority=True) for s in self.priority_universe]
+            await asyncio.gather(*tasks)
+            
+            await asyncio.sleep(10) # 10s frequency for priority news
+
+    async def _run_yahoo_loop(self):
+        """Polls active monitoring list (excluding priority) at normal pace."""
+        while self.running:
+            # Only poll symbols NOT in priority
+            standard_list = [s for s in self.monitoring_universe if s not in self.priority_universe]
+            
+            if not standard_list:
+                 await asyncio.sleep(5)
                  continue
                  
-            # Poll all active symbols rapidly
-            tasks = []
-            for symbol in self.monitoring_universe:
-                if not self.running: break
-                tasks.append(self._poll_symbol(symbol))
+            # Rapid poll of standard list but with longer sleep between cycles
+            tasks = [self._poll_symbol(s) for s in standard_list]
+            await asyncio.gather(*tasks)
             
-            # Run symbol polls concurrently (parallel network requests)
-            if tasks:
-                await asyncio.gather(*tasks)
-            
-            await asyncio.sleep(30) # Wait before next detailed scan of monitoring list
+            await asyncio.sleep(45) # 45s wait for standard
 
     async def _run_av_loop(self):
         """Polls Global News Stream using Alpha Vantage."""
@@ -212,75 +254,52 @@ class MarketStream:
             logger.error(f"Failed to fetch history for {symbol}: {e}")
             return pd.DataFrame()
 
-    async def _poll_symbol(self, symbol: str):
+    async def _poll_symbol(self, symbol: str, is_priority: bool = False):
         """Fetches live data for a single symbol."""
         try:
-            logger.info(f"Polling {symbol}...") # Verbose debug
+            # logger.info(f"Polling {symbol}...") # Verbose debug
             
-            # Run blocking yfinance call in a separate thread to keep UI responsive
+            # Run blocking yfinance call in a separate thread
             ticker = await asyncio.to_thread(yf.Ticker, symbol)
             
             # 1. Get Fast Info (Price)
             price = None
             try:
                 price = ticker.fast_info.last_price
-                logger.info(f"{symbol} Price: {price}")
             except Exception as e:
-                logger.warning(f"Fast Info failed for {symbol}: {e}. Trying fallback...")
-                try:
-                    # Fallback to slower .info
-                    info = await asyncio.to_thread(lambda: ticker.info)
-                    price = info.get('currentPrice') or info.get('regularMarketPrice')
-                except Exception as e2:
-                    logger.error(f"Fallback poll failed for {symbol}: {e2}")
+                # Silently fallback for multi-tasking stability
+                pass
             
             if price is not None:
-                # Detect Price Change
-                last_price = self._cache.get(symbol, price)
                 self._cache[symbol] = price
-            else:
-                logger.warning(f"Could not retrieve price for {symbol}")
             
-            # 2. Get News - Re-enabled for Hybrid Coverage (Yahoo + Alpha Vantage)
-            # logger.info(f"Polling Yahoo for {symbol}...")
+            # 2. Get News
             news_list = await asyncio.to_thread(lambda: ticker.news)
             
             if news_list:
-                logger.debug(f"Yahoo found {len(news_list)} items for {symbol}")
-                for latest in news_list[:2]: # Check top 2 recent news items, not just 1
-                    # Check for nested 'content' (common in recent yfinance)
-                    # Correct Parsing Logic for both flat and nested yfinance objects
+                # Priority: check more news items, Standard: check top 2
+                limit = 5 if is_priority else 2
+                for latest in news_list[:limit]:
                     content = latest.get('content', latest) 
-                    
                     headline = content.get('title') or content.get('headline', 'No Headline')
                     publisher = content.get('publisher', 'Unknown')
                     url = content.get('canonicalUrl', {}).get('url', '') if isinstance(content.get('canonicalUrl'), dict) else content.get('link', '')
                     
-                    if headline == "No Headline":
-                         continue
+                    if headline == "No Headline" or not url: continue
                     
-                    # --- DEDUPLICATION (Hybrid) ---
-                    dedup_key = url if url else f"{headline}|{publisher}"
-                     
-                    # Check DB
-                    # if self.db and self.db.is_news_seen(dedup_key):
-                    #      # logger.info(f"Skipping duplicate Yahoo news: {headline}")
-                    #      continue 
-                    if dedup_key in self._news_dedup:
-                         continue
+                    dedup_key = url
+                    if dedup_key in self._news_dedup: continue
+                    if self.db and self.db.is_news_seen(dedup_key): continue
                          
-                    # Mark Seen
                     self._news_dedup.add(dedup_key)
                     if self.db: self.db.mark_news_seen(dedup_key)
                     
-                    logger.info(f"New Yahoo News for {symbol}: {headline}")
+                    logger.info(f"{'🚨 PRIORITY' if is_priority else 'New'} News for {symbol}: {headline}")
 
-                    # Extract Summary if available (Fallback to headline if missing)
                     summary = latest.get('summary', '') 
                     if not summary and 'content' in latest and isinstance(latest['content'], dict):
                         summary = latest['content'].get('summary', '')
 
-                    # Emit RAW_NEWS
                     event = MarketEvent(
                         event_type="RAW_NEWS",
                         symbol=symbol,
@@ -289,7 +308,8 @@ class MarketStream:
                             "headline": headline,
                             "summary": summary,
                             "sentiment": "NEUTRAL", 
-                            "url": url
+                            "url": url,
+                            "is_priority": is_priority
                         },
                         timestamp=time.time()
                     )
